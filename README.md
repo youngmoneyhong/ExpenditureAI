@@ -1,0 +1,2 @@
+# ExpenditureAI
+Tracking my expenditure

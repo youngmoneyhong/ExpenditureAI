@@ -1,5 +1,4 @@
 # ExpenditureAI
-
 ExpenditureAI is a local Streamlit app that turns UOB TMRW, DBS Bank, and DBS PayLah transaction screenshots into a reviewed personal-expense ledger in Google Sheets.
 
 It is designed for a practical monthly workflow: upload screenshots, review extracted transactions, resolve duplicates and categorisation, then append checked rows to the correct year and month worksheet.

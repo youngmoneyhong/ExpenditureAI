@@ -154,6 +154,14 @@ class GoogleSheetOutputTests(unittest.TestCase):
         self.assertIn('{"June Summary","",""}', formula)
         self.assertIn('{"July Summary","",""}', formula)
 
+    def test_future_month_is_added_as_a_summary_column(self):
+        matrix, _ = _summary_matrix_rows(
+            [FakeWorksheet("August"), FakeWorksheet("September")],
+            "2026",
+        )
+
+        self.assertEqual(matrix[0], ["Category", "Aug 2026", "Sep 2026", "Year Total"])
+
     def test_summary_matrix_has_month_year_columns_and_net_spend(self):
         matrix, layout = _summary_matrix_rows(
             [FakeWorksheet("June"), FakeWorksheet("Jul"), FakeWorksheet("Aug")],

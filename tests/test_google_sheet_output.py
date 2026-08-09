@@ -24,6 +24,7 @@ from sheets import (
     _annual_overview_rows,
     _checked_category_summary_formula,
     _format_year_summary,
+    _period_from_date,
     _rows_for_worksheet,
     _summary_matrix_rows,
 )
@@ -161,6 +162,10 @@ class GoogleSheetOutputTests(unittest.TestCase):
         )
 
         self.assertEqual(matrix[0], ["Category", "Aug 2026", "Sep 2026", "Year Total"])
+
+    def test_future_years_route_to_their_own_workbooks(self):
+        self.assertEqual(_period_from_date("2027-01-03"), (2027, "January"))
+        self.assertEqual(_period_from_date("2028-12-31"), (2028, "December"))
 
     def test_summary_matrix_has_month_year_columns_and_net_spend(self):
         matrix, layout = _summary_matrix_rows(

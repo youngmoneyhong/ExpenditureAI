@@ -96,6 +96,7 @@ Rules:
 - Use DBS_PAYLAH only if the screenshot clearly shows PayLah branding, PayLah wallet, mobile number/name transfers, QR payments, or PayLah transaction language.
 - Use DBS_BANK only for normal DBS/POSB deposit, savings, current, card, or account transactions.
 - Use UOB_TMRW only for UOB TMRW app, UOB account, or UOB card transaction screens.
+- Ignore UOB_TMRW transaction rows whose description starts with PAYMT THRU E-BANK.
 - If source is unclear, use UNKNOWN and add a warning.
 - Flag reimbursement_candidate=true only when the row is an incoming inflow from an individual and the description/reference suggests repayment, splitting, shared expense, food, ride, booking, tickets, hotel, cab, Grab, dinner, lunch, drinks, or settlement.
 - Do not flag all incoming PayLah transfers as reimbursements. If it is only a name with no reference, set reimbursement_candidate=false unless there is strong context.

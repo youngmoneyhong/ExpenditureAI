@@ -430,6 +430,12 @@ def is_paylah_wallet_topup(dataframe: pd.DataFrame) -> pd.Series:
     )
 
 
+def is_uob_ebanking_payment(dataframe: pd.DataFrame) -> pd.Series:
+    sources = dataframe["source"].astype(str).str.upper().str.strip()
+    descriptions = dataframe["description"].apply(normalize_description)
+    return sources.eq("UOB_TMRW") & descriptions.str.startswith("PAYMT THRU E-BANK")
+
+
 def apply_category_flow_rules(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe.empty:
         return dataframe
@@ -571,7 +577,9 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
         na=False,
     )
 
-    topup_mask = is_paylah_wallet_topup(working)
+    paylah_topup_mask = is_paylah_wallet_topup(working)
+    uob_ebanking_mask = is_uob_ebanking_payment(working)
+    topup_mask = paylah_topup_mask | uob_ebanking_mask
     working.loc[topup_mask, "status"] = "ignored"
     working.loc[topup_mask, "include_in_append"] = False
     working.loc[topup_mask, "ignore_reason"] = "PayLah wallet top-up"
@@ -582,6 +590,10 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     working.loc[topup_mask, "reimbursement_candidate"] = False
     working.loc[topup_mask, "reimbursement_for"] = ""
     working.loc[topup_mask, "category"] = "Transfer"
+    working.loc[uob_ebanking_mask, "ignore_reason"] = "UOB e-banking payment"
+    working.loc[uob_ebanking_mask, "review_note"] = (
+        "Ignored by default: UOB PAYMT THRU E-BANK"
+    )
 
     # A flow edit is authoritative: keep its amount sign correct automatically.
     amounts = pd.to_numeric(working["amount"], errors="coerce").fillna(0)

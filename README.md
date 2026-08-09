@@ -13,6 +13,7 @@ It is designed for a practical monthly workflow: upload screenshots, review extr
 - Shows duplicate comparisons side by side, including matched fields and archived screenshots where available.
 - Learns deliberate merchant-category decisions locally; the Merchant rules screen lets you inspect, edit, or forget these decisions.
 - Ignores DBS Bank and DBS PayLah PayLah wallet top-ups by default, so internal wallet movements do not become expenses.
+- Ignores UOB TMRW rows starting with `PAYMT THRU E-BANK` by default.
 - Enforces normal transaction signs in the app: outflows are negative and inflows are positive.
 - Creates year workbooks and month tabs automatically, based on each transaction date.
 - Writes a concise, user-facing A-L Google Sheets ledger and hides non-user-facing processing data.

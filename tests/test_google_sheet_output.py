@@ -325,6 +325,26 @@ class ReimbursementWorkflowTests(unittest.TestCase):
         self.assertFalse(result.at[0, "include_in_append"])
         self.assertEqual(result.at[0, "status"], "ignored")
 
+    def test_uob_ebanking_payment_stays_ignored(self):
+        dataframe = rows_to_dataframe(
+            [
+                {
+                    "date": "2026-06-04",
+                    "source": "UOB_TMRW",
+                    "description": "PAYMT THRU E-BANK CARD PAYMENT",
+                    "amount": "-20.00",
+                    "money_flow": "outflow",
+                    "category": "Bills",
+                }
+            ]
+        )
+
+        result = apply_workflow_state(dataframe)
+
+        self.assertFalse(result.at[0, "include_in_append"])
+        self.assertEqual(result.at[0, "status"], "ignored")
+        self.assertEqual(result.at[0, "ignore_reason"], "UOB e-banking payment")
+
 
 class OverlappingScreenshotDuplicateTests(unittest.TestCase):
     def test_flags_ocr_variants_of_the_same_transaction(self):

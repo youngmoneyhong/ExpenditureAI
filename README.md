@@ -66,7 +66,7 @@ Column D is widened for categories, column E is widened for merchant description
 
 The `Summary` tab is a single matrix instead of separate monthly blocks:
 
-- Rows: Net Spend, spending categories, Gross Spend, the four inflow offsets, and Total Offset.
+- Rows: Net Spend, variable spending categories, Variable Spend (a), fixed spending categories, Fixed Spend (b), Gross Spend (a + b), the four inflow offsets, and Total Offset (c).
 - Columns: calendar-ordered `Month Year` values plus `Year Total`.
 - Net Spend, Gross Spend, and Total Offset are visually emphasized.
 - Insurance, Subscriptions, and Income Tax are lightly shaded as recurring or fixed-cost areas.

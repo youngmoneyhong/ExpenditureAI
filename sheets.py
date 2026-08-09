@@ -655,6 +655,17 @@ class SheetClient:
                 "textFormat": {"bold": True, "fontSize": 12},
             },
         )
+        for summary_row, color in (
+            (layout["variable_spend_row"], {"red": 0.93, "green": 0.96, "blue": 0.98}),
+            (layout["fixed_spend_row"], {"red": 0.94, "green": 0.94, "blue": 0.94}),
+        ):
+            worksheet.format(
+                f"A{summary_row}:{matrix_end_col}{summary_row}",
+                {
+                    "backgroundColor": color,
+                    "textFormat": {"bold": False, "fontSize": 12},
+                },
+            )
         for fixed_cost_category in ("Insurance", "Subscriptions", "Income Tax"):
             fixed_cost_row = next(
                 row_index
@@ -990,10 +1001,14 @@ def _monthly_gross_spend_formula(worksheet, *, headers: list[str] | None = None)
 
 
 def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[str]], dict[str, int]]:
+    fixed_categories = ["Insurance", "Subscriptions", "Income Tax"]
     spending_categories = [
         category
         for category in CATEGORY_OPTIONS
         if category not in INFLOW_CATEGORY_OPTIONS and category != "Transfer"
+    ]
+    variable_categories = [
+        category for category in spending_categories if category not in fixed_categories
     ]
     offset_categories = [
         "Carousell Sales",
@@ -1003,12 +1018,12 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
     ]
     month_headers = [_summary_month_label(worksheet, year) for worksheet in month_worksheets]
     matrix = [["Category", *month_headers, "Year Total"]]
-    matrix.append(["Net Spend", *([""] * len(month_worksheets)), ""])
+    matrix.append(["Net Spend (a + b + c)", *([""] * len(month_worksheets)), ""])
 
     headers_by_worksheet = {
         worksheet.title: _worksheet_headers(worksheet) for worksheet in month_worksheets
     }
-    for category in spending_categories:
+    for category in variable_categories:
         matrix.append(
             [category]
             + [
@@ -1021,8 +1036,22 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
             ]
             + [""]
         )
-
-    matrix.append(["Gross Spend", *([""] * len(month_worksheets)), ""])
+    matrix.append(["Variable Spend (a)", *([""] * len(month_worksheets)), ""])
+    for category in fixed_categories:
+        matrix.append(
+            [category]
+            + [
+                _monthly_category_formula(
+                    worksheet,
+                    category,
+                    headers=headers_by_worksheet[worksheet.title],
+                )
+                for worksheet in month_worksheets
+            ]
+            + [""]
+        )
+    matrix.append(["Fixed Spend (b)", *([""] * len(month_worksheets)), ""])
+    matrix.append(["Gross Spend (a + b)", *([""] * len(month_worksheets)), ""])
     for category in offset_categories:
         matrix.append(
             [category]
@@ -1036,12 +1065,16 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
             ]
             + [""]
         )
-    matrix.append(["Total Offset", *([""] * len(month_worksheets)), ""])
+    matrix.append(["Total Offset (c)", *([""] * len(month_worksheets)), ""])
 
     net_spend_row = 2
-    first_category_row = 3
-    last_spending_row = first_category_row + len(spending_categories) - 1
-    gross_spend_row = last_spending_row + 1
+    first_variable_row = 3
+    last_variable_row = first_variable_row + len(variable_categories) - 1
+    variable_spend_row = last_variable_row + 1
+    first_fixed_row = variable_spend_row + 1
+    last_fixed_row = first_fixed_row + len(fixed_categories) - 1
+    fixed_spend_row = last_fixed_row + 1
+    gross_spend_row = fixed_spend_row + 1
     first_offset_row = gross_spend_row + 1
     last_offset_row = first_offset_row + len(offset_categories) - 1
     total_offset_row = last_offset_row + 1
@@ -1049,27 +1082,40 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
     last_month_col = first_month_col + len(month_worksheets) - 1
     year_total_col = first_month_col + len(month_worksheets)
 
-    for row_index in list(range(first_category_row, last_spending_row + 1)) + list(
-        range(first_offset_row, last_offset_row + 1)
+    for row_index in (
+        list(range(first_variable_row, last_variable_row + 1))
+        + list(range(first_fixed_row, last_fixed_row + 1))
+        + list(range(first_offset_row, last_offset_row + 1))
     ):
         matrix[row_index - 1][-1] = _summary_row_total_formula(
             row_index,
             first_month_col,
             last_month_col,
-    )
+        )
+    for row_index in (variable_spend_row, fixed_spend_row):
+        matrix[row_index - 1][-1] = _summary_row_total_formula(
+            row_index,
+            first_month_col,
+            last_month_col,
+        )
 
     for month_index in range(len(month_worksheets)):
         worksheet = month_worksheets[month_index]
         headers = headers_by_worksheet[worksheet.title]
-        matrix[gross_spend_row - 1][month_index + 1] = _monthly_gross_spend_formula(
-            worksheet,
-            headers=headers,
-        )
         matrix[net_spend_row - 1][month_index + 1] = _monthly_net_spend_formula(
             worksheet,
             headers=headers,
         )
         column = _column_letter(first_month_col + month_index)
+        matrix[variable_spend_row - 1][month_index + 1] = (
+            f"=SUM({column}{first_variable_row}:{column}{last_variable_row})"
+        )
+        matrix[fixed_spend_row - 1][month_index + 1] = (
+            f"=SUM({column}{first_fixed_row}:{column}{last_fixed_row})"
+        )
+        matrix[gross_spend_row - 1][month_index + 1] = (
+            f"={column}{variable_spend_row}+{column}{fixed_spend_row}"
+        )
         matrix[total_offset_row - 1][month_index + 1] = (
             f"=SUM({column}{first_offset_row}:{column}{last_offset_row})"
         )
@@ -1090,6 +1136,8 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
         last_month_col,
     )
     return matrix, {
+        "variable_spend_row": variable_spend_row,
+        "fixed_spend_row": fixed_spend_row,
         "gross_spend_row": gross_spend_row,
         "first_offset_row": first_offset_row,
         "last_offset_row": last_offset_row,

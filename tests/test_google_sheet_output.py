@@ -174,12 +174,12 @@ class GoogleSheetOutputTests(unittest.TestCase):
         )
 
         self.assertEqual(matrix[0], ["Category", "Jun 2026", "Jul 2026", "Aug 2026", "Year Total"])
-        self.assertEqual(matrix[1][0], "Net Spend")
+        self.assertEqual(matrix[1][0], "Net Spend (a + b + c)")
         self.assertEqual(
             [row[0] for row in matrix],
             [
                 "Category",
-                "Net Spend",
+                "Net Spend (a + b + c)",
                 "Food",
                 "Public Transport",
                 "Taxi",
@@ -193,22 +193,26 @@ class GoogleSheetOutputTests(unittest.TestCase):
                 "Bills",
                 "Admin & Fees",
                 "Others",
+                "Variable Spend (a)",
                 "Insurance",
                 "Subscriptions",
                 "Income Tax",
-                "Gross Spend",
+                "Fixed Spend (b)",
+                "Gross Spend (a + b)",
                 "Carousell Sales",
                 "Cashbacks & Refunds",
                 "Reimbursement",
                 "GVs & Prize Award",
-                "Total Offset",
+                "Total Offset (c)",
             ],
         )
         carousell_row = next(row for row in matrix if row[0] == "Carousell Sales")
         self.assertTrue(carousell_row[1].startswith("=-IFERROR"))
-        self.assertEqual(matrix[layout["gross_spend_row"] - 1][0], "Gross Spend")
-        self.assertEqual(matrix[layout["total_offset_row"] - 1][0], "Total Offset")
-        self.assertEqual(matrix[layout["net_spend_row"] - 1][0], "Net Spend")
+        self.assertEqual(matrix[layout["gross_spend_row"] - 1][0], "Gross Spend (a + b)")
+        self.assertEqual(matrix[layout["total_offset_row"] - 1][0], "Total Offset (c)")
+        self.assertEqual(matrix[layout["net_spend_row"] - 1][0], "Net Spend (a + b + c)")
+        self.assertIn("=SUM(B3:B15)", matrix[layout["variable_spend_row"] - 1][1])
+        self.assertIn("=SUM(B17:B19)", matrix[layout["fixed_spend_row"] - 1][1])
         self.assertIn("SUMPRODUCT", matrix[layout["net_spend_row"] - 1][1])
         self.assertNotIn("LOWER(", matrix[layout["net_spend_row"] - 1][1])
 
@@ -222,10 +226,10 @@ class GoogleSheetOutputTests(unittest.TestCase):
 
         ranges = [cell_range for cell_range, _ in summary.updates]
         self.assertFalse(summary.cleared)
-        self.assertEqual(ranges[0], "A1:D24")
+        self.assertEqual(ranges[0], "A1:D26")
         self.assertEqual(summary.frozen, (1, 1))
-        self.assertIn("A25:ZZ1000", summary.cleared_ranges)
-        self.assertIn("E1:ZZ24", summary.cleared_ranges)
+        self.assertIn("A27:ZZ1000", summary.cleared_ranges)
+        self.assertIn("E1:ZZ26", summary.cleared_ranges)
 
     def test_default_column_widths_are_150_then_100_pixels(self):
         spreadsheet = FakeSpreadsheet([])

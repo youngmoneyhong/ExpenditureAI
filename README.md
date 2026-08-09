@@ -1,82 +1,168 @@
 # ExpenditureAI
-ExpenditureAI is a local Streamlit app that turns UOB TMRW, DBS Bank, and DBS PayLah transaction screenshots into a reviewed personal-expense ledger in Google Sheets.
 
-It is designed for a practical monthly workflow: upload screenshots, review extracted transactions, resolve duplicates and categorisation, then append checked rows to the correct year and month worksheet.
+> **A private, review-first AI expense operations layer for bank screenshots.**
+>
+> Turn DBS Bank, DBS PayLah, and UOB TMRW screenshots into a clean Google Sheets ledger, without rekeying transactions or accidentally double-counting them.
 
-## Features
+| Product | Workflow | Destination |
+| --- | --- | --- |
+| **AI receipt inbox** | Upload -> extract -> review -> confirm | **Google Sheets annual ledger** |
+| Built with Streamlit and OpenAI Vision | Duplicate-aware and human-controlled | Monthly tabs plus an annual summary |
 
-- Extracts transactions from one or many screenshots with OpenAI Vision.
-- Processes several screenshots concurrently (configurable from one to four workers) to reduce waiting time.
-- Uses a strict structured extraction schema for dates, merchant descriptions, amounts, source, money flow, references, and confidence.
-- Runs one combined AI enrichment request for category suggestions, anomaly flags, and a short spending insight.
-- Detects exact duplicates, previously appended transactions, and likely repeated rows caused by overlapping screenshots. A transaction already recorded in the matching Google Sheets month tab is automatically marked unchecked, so it will not be appended again unless you deliberately reselect it.
-- Shows duplicate comparisons side by side, including matched fields and archived screenshots where available.
-- Learns deliberate merchant-category decisions locally; the Merchant rules screen lets you inspect, edit, or forget these decisions.
-- Ignores DBS Bank and DBS PayLah PayLah wallet top-ups by default, so internal wallet movements do not become expenses.
-- Ignores UOB TMRW rows starting with `PAYMT THRU E-BANK` by default.
-- Enforces normal transaction signs in the app: outflows are negative and inflows are positive.
-- Creates year workbooks and month tabs automatically, based on each transaction date. A 2027 transaction creates or uses the `2027` workbook instead of being added to `2026`; the same routing applies to 2028 and every later year.
-- Writes a concise, user-facing A-L Google Sheets ledger and hides non-user-facing processing data.
-- Creates and refreshes a single annual Summary matrix with category rows, month-year columns, year totals, net spend, gross spend, and offsets.
+## The Product
+
+```mermaid
+flowchart LR
+    A[Bank screenshots] --> B[AI transaction extraction]
+    B --> C[Normalize and classify]
+    C --> D{Duplicate checks}
+    D -->|Already in Sheets| E[Automatically untick]
+    D -->|New or reviewed repeat| F[Review table]
+    E --> F
+    F --> G[Confirmed transactions]
+    G --> H[Year workbook + month tab]
+    H --> I[Formula-driven annual summary]
+```
+
+### Built for the moment after you pay
+
+| | What ExpenditureAI does | Why it matters |
+| --- | --- | --- |
+| **1. Capture** | Reads one or many bank screenshots with structured AI extraction. | Eliminates manual transaction entry. |
+| **2. Control** | Detects overlaps, known transactions, incorrect signs, and category conflicts before append. | Keeps the ledger trustworthy. |
+| **3. Organize** | Routes each record into the right year workbook and month tab automatically. | Keeps every year self-contained. |
+| **4. Understand** | Maintains a monthly category matrix, subtotals, offsets, and year totals. | Makes spending patterns immediately legible. |
+
+## MVP Capabilities
+
+| AI extraction | Financial controls | Sheets automation |
+| --- | --- | --- |
+| Typed transactions from UOB TMRW, DBS Bank, and DBS PayLah screenshots | Inflow/outflow sign rules and category validation | Creates a workbook for each year automatically |
+| Concurrent screenshot processing with bounded workers | Side-by-side duplicate comparison before deciding a genuine repeat | Creates a month tab and summary column when a new month appears |
+| Category suggestions, anomaly flags, and a short spending insight in one enrichment request | Existing Google Sheets matches are automatically unticked | Keeps the annual summary formula-driven and current |
+| Merchant-rule learning with an inspect, edit, and forget screen | Ignores internal PayLah top-ups and UOB e-banking payment rows | Writes a clean user-facing ledger in columns A-L |
+
+## System Design
+
+```mermaid
+flowchart TB
+    subgraph Local[Local Streamlit application]
+        Upload[Upload screenshots]
+        Vision[OpenAI Vision extraction]
+        Normalize[Schema validation and normalization]
+        Rules[Merchant rules and flow/category rules]
+        Dedupe[Hybrid duplicate engine]
+        Review[Editable review table]
+        Upload --> Vision --> Normalize --> Rules --> Dedupe --> Review
+    end
+
+    subgraph Storage[User-controlled storage]
+        Memory[review_memory.json]
+        Archive[Screenshot archive]
+        Drive[Google Drive folder]
+        Workbook[YYYY Google Sheets workbook]
+        Tabs[Month tabs + Summary]
+        Drive --> Workbook --> Tabs
+    end
+
+    Rules <--> Memory
+    Upload --> Archive
+    Review -->|append checked transactions| Drive
+```
+
+### Decision model
+
+```mermaid
+flowchart LR
+    Candidate[Extracted transaction] --> Similarity{Matches upload or target month tab?}
+    Similarity -->|Yes| Duplicate[Mark duplicate and untick]
+    Similarity -->|No| Ready[Ready for review]
+    Duplicate --> Compare[Show matched fields and screenshots]
+    Compare --> Human{Genuine repeat?}
+    Human -->|Yes| Override[Allow separate duplicate]
+    Human -->|No| Skip[Do not append]
+    Ready --> Confirm[Append checked rows]
+    Override --> Confirm
+```
+
+Duplicate checks combine transaction hashes, keys, exact references, date, source, amount, currency, money flow, and conservative merchant-description similarity. A transaction already recorded in the matching Google Sheets month tab is automatically unchecked in the review table, so it cannot be appended again unless you deliberately reselect it.
+
+## Annual Workbook Routing
+
+```mermaid
+flowchart LR
+    Transaction[Reviewed transaction date] --> Year{Transaction year}
+    Year -->|2026| W2026[2026 Google Sheets workbook]
+    Year -->|2027| W2027[2027 Google Sheets workbook]
+    Year -->|2028+| WFuture[Matching future-year workbook]
+    W2026 --> M1[Create/use month tab]
+    W2027 --> M2[Create/use month tab]
+    WFuture --> M3[Create/use month tab]
+    M1 --> S1[Refresh annual Summary]
+    M2 --> S2[Refresh annual Summary]
+    M3 --> S3[Refresh annual Summary]
+```
+
+Transactions never get compiled into the wrong year. Uploading a 2027 transaction creates or uses a `2027` Google Sheets workbook instead of adding it to `2026`; the same routing applies to 2028 and every later year. A newly seen month creates a month tab and a new month column in that year's Summary.
 
 ## Categories And Money Flow
 
-### Outflow categories
-
-`Food`, `Public Transport`, `Taxi`, `Shopping`, `Gifts`, `Entertainment`, `Travel`, `Health`, `Personal Care`, `Education`, `Bills`, `Admin & Fees`, `Others`, `Insurance`, `Subscriptions`, and `Income Tax`.
-
-### Inflow categories
-
-`Carousell Sales`, `Cashbacks & Refunds`, `Reimbursement`, and `GVs & Prize Award`.
-
-All four inflow categories are shown in the Summary as offsets. They reduce `Net Spend` and roll up into `Total Offset`.
-
-`Transfer` is reserved for neutral internal transfers, including ignored PayLah top-ups.
-
-## How It Works
-
-1. Upload transaction screenshots in the Streamlit app.
-2. Vision extraction reads each screenshot and produces transaction candidates.
-3. The app normalizes dates, sources, descriptions, categories, and signed amounts.
-4. Duplicate logic compares rows within the upload and against the target Google Sheet period. Matches already recorded in that month tab are automatically unticked in the review table.
-5. Review the transaction table, correct category, flow, amount, or duplicate decisions, and choose which dates to append.
-6. Confirmed rows are appended to the matching `YYYY` Google Sheets workbook and month tab. New years automatically receive their own workbook, while new months create a tab within that year's workbook.
-7. The annual `Summary` tab refreshes automatically.
-
-## Google Sheets Layout
-
-Each month tab keeps the user-facing ledger in columns A-L:
-
-| Column | Field |
+| Outflows | Inflows / offsets |
 | --- | --- |
-| A | `check` |
-| B | `date` |
-| C | `source` |
-| D | `category` |
-| E | `description` |
-| F | `amount_original` |
-| G | `amount_parse_error` |
-| H | `amount` |
-| I | `currency` |
-| J | `transaction_reference` |
-| K | `money_flow` |
-| L | `transaction_type` |
+| `Food`, `Public Transport`, `Taxi`, `Shopping`, `Gifts`, `Entertainment`, `Travel`, `Health`, `Personal Care`, `Education`, `Bills`, `Admin & Fees`, `Others`, `Insurance`, `Subscriptions`, `Income Tax` | `Carousell Sales`, `Cashbacks & Refunds`, `Reimbursement`, `GVs & Prize Award` |
 
-Column D is widened for categories, column E is widened for merchant descriptions, and the header row is frozen. The `check` and `category` fields have dropdowns for manual review.
+Outflows must be negative and inflows must be positive. Inflow categories are shown in the Summary as offsets: they reduce `Net Spend` and roll into `Total Offset (c)`. `Transfer` is reserved for neutral internal transfers, including ignored PayLah top-ups.
 
-The `Summary` tab is a single matrix instead of separate monthly blocks:
+## Google Sheets Experience
 
-- Rows: Net Spend, variable spending categories, Variable Spend (a), fixed spending categories, Fixed Spend (b), Gross Spend (a + b), the four inflow offsets, Total Offset (c), and a repeated closing Net Spend total.
-- Columns: calendar-ordered `Month Year` values plus `Year Total`.
-- Net Spend, Gross Spend, and Total Offset are visually emphasized.
-- Insurance, Subscriptions, and Income Tax are lightly shaded as recurring or fixed-cost areas.
-- Summary column A is widened for readable category names.
+### Monthly ledger
 
-Only month-tab rows with `check = Yes` are included in Summary totals.
+Each month tab keeps the user-facing ledger in columns A-L. The header is frozen, category and check fields have dropdowns, column D is widened for categories, and column E is widened for merchant descriptions.
+
+| A | B | C | D | E | F | G | H | I | J | K | L |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `check` | `date` | `source` | `category` | `description` | `amount_original` | `amount_parse_error` | `amount` | `currency` | `transaction_reference` | `money_flow` | `transaction_type` |
+
+### Annual Summary
+
+The Summary is one readable matrix: categories as rows, calendar-ordered `Month Year` columns, and a `Year Total` column. Only monthly rows with `check = Yes` are included.
+
+```text
+Net Spend (a + b + c)          highlighted closing figure
+  Variable categories
+Variable Spend (a)             variable-spend subtotal
+  Insurance / Subscriptions / Income Tax
+Fixed Spend (b)                fixed-spend subtotal
+Gross Spend (a + b)            spend before offsets
+  Carousell Sales / Cashbacks & Refunds / Reimbursement / GVs & Prize Award
+Total Offset (c)               inflow total
+Net Spend (a + b + c)          repeated closing figure
+```
+
+Variable spend, fixed spend, gross spend, offsets, and net spend are visually differentiated so a user can scan the calculation rather than audit formulas.
+
+## How To Use It
+
+1. Upload one or more transaction screenshots in the Streamlit app.
+2. Let the app extract, normalize, classify, and compare transactions.
+3. Review the table. Correct category, money flow, amount, or duplicate decisions where needed.
+4. Confirm the checked rows to append them to the matching `YYYY` workbook and month tab.
+5. Open the refreshed `Summary` tab for the annual view.
+
+### Review states
+
+| State | Meaning | Default action |
+| --- | --- | --- |
+| `ready` | New transaction that can be appended | Checked |
+| `needs_review` | A field needs human confirmation | Review before append |
+| `duplicate` | Likely already recorded or repeated | Unchecked |
+| `ignored` | Intentional non-expense movement | Unchecked |
+
+The `Dates to append` selector defaults to every extracted valid date. Remove a date to skip it for the current append only. Use `separate duplicate?` only after confirming a duplicate is a real, separate transaction.
 
 ## Setup
 
-### 1. Create a virtual environment
+### 1. Install
 
 ```powershell
 python -m venv .venv
@@ -85,9 +171,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-### 2. Configure environment variables
-
-Edit `.env` and provide:
+### 2. Configure `.env`
 
 ```text
 OPENAI_API_KEY=...
@@ -96,83 +180,63 @@ GOOGLE_SERVICE_ACCOUNT_FILE=service_account.json
 VISION_CONCURRENCY=3
 ```
 
-Optional settings:
+| Optional setting | Purpose |
+| --- | --- |
+| `OPENAI_MODEL` | Model used for the enrichment request. |
+| `GOOGLE_SHEET_ID` | Use one fixed spreadsheet instead of year/month routing. |
+| `GOOGLE_WORKSHEET_NAME` | Worksheet name for fixed-spreadsheet mode. |
+| `SCREENSHOT_ARCHIVE_DIR` | Archive folder; defaults to `screenshots`. |
+| `REVIEW_MEMORY_FILE` | Merchant-rule store; defaults to `review_memory.json`. |
 
-- `OPENAI_MODEL`: model used for the enrichment request.
-- `GOOGLE_SHEET_ID`: use one fixed spreadsheet instead of year/month routing.
-- `GOOGLE_WORKSHEET_NAME`: worksheet name for fixed-spreadsheet mode.
-- `SCREENSHOT_ARCHIVE_DIR`: archive folder; defaults to `screenshots`.
-- `REVIEW_MEMORY_FILE`: path for local merchant-rule memory; defaults to `review_memory.json`.
-
-### 3. Configure Google access
+### 3. Connect Google Drive
 
 1. Create a Google Cloud service account.
 2. Enable the Google Sheets API and Google Drive API.
 3. Download its JSON key as `service_account.json`.
 4. Share the target Google Drive folder with the service-account email as an Editor.
-5. Place the folder ID in `GOOGLE_DRIVE_FOLDER_ID`.
+5. Add the folder ID to `GOOGLE_DRIVE_FOLDER_ID`.
 
-Detailed instructions are in [GOOGLE_SETUP.md](GOOGLE_SETUP.md).
-
-Your Drive folder will be organised automatically like this:
+Detailed instructions: [GOOGLE_SETUP.md](GOOGLE_SETUP.md).
 
 ```text
 Expenditure folder
   2026 Google Sheet
     May tab
     June tab
-    July tab
+    Summary tab
   2027 Google Sheet
     January tab
+    Summary tab
 ```
 
-## Run The App
+## Run
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 streamlit run app.py
 ```
 
-Or run `launch.bat` on Windows.
+On Windows, `launch.bat` starts the app as well.
 
-## Review And Append Workflow
+## AI And Data Principles
 
-The review table is the decision point before anything reaches Google Sheets.
-
-- `ready`: can be appended.
-- `needs_review`: check the row before appending.
-- `duplicate`: skipped by default; use `separate duplicate?` only for a genuine repeat transaction.
-- `ignored`: intentionally excluded, such as a PayLah wallet top-up.
-
-The `Dates to append` selector defaults to every extracted valid date. Remove a date to skip it for the current append only.
-
-Before appending, the app checks for date/source/description/amount/currency duplicates in the matching month sheet. It also compares overlapping screenshot candidates conservatively using date, source, amount, flow, currency, transaction reference, and merchant-description similarity.
-
-## AI Techniques Used
-
-- **Multimodal Vision extraction**: reads bank-app screenshots into typed transaction records.
-- **Pydantic structured output**: validates AI extraction and enrichment responses against a predictable schema.
-- **Concurrent processing**: uses bounded parallel Vision requests for faster multi-screenshot batches.
-- **Combined enrichment**: category, anomaly, and insight analysis share one model request to reduce latency and cost.
-- **Rule-based normalization**: standardizes category names, dates, currency, signed amounts, and flow constraints.
-- **Hybrid duplicate detection**: combines hashes, transaction keys, exact references, amounts, and conservative string similarity.
-- **Human-in-the-loop review**: every extraction can be inspected and edited before append.
-- **Local learning**: reviewed merchant decisions are stored in `review_memory.json`, with controls to edit or forget them.
-- **Formula-driven summaries**: Google Sheets formulas keep the annual Summary current when checked monthly rows change.
+| Principle | Implementation |
+| --- | --- |
+| Structured AI, not free-form text | Pydantic schemas validate extraction and enrichment responses. |
+| Fast enough for batches | Bounded concurrent Vision requests process several screenshots at once. |
+| One place for judgment | Category suggestions, anomaly flags, and spending insight share one enrichment request. |
+| Human stays in control | No transaction is appended until it remains checked in the editable review table. |
+| Private by default | The app runs locally; sensitive credentials and records are excluded from Git. |
 
 ## Tests
-
-Run the regression suite with:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The tests cover Google Sheets output, summary formulas and layout, category migrations, reimbursement/offset rules, duplicate detection, merchant rules, and performance behaviour.
+The regression suite covers Google Sheets output, summary formulas and layout, category migrations, reimbursement and offset rules, duplicate detection, merchant rules, year/month routing, and performance behaviour.
 
 ## Privacy And Security
-
-This project is intended to run locally. Bank screenshots are sensitive:
 
 - Screenshots are sent to OpenAI only for the requested extraction.
 - Confirmed transactions are sent to Google Sheets only when you append them.

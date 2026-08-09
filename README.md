@@ -9,13 +9,13 @@ It is designed for a practical monthly workflow: upload screenshots, review extr
 - Processes several screenshots concurrently (configurable from one to four workers) to reduce waiting time.
 - Uses a strict structured extraction schema for dates, merchant descriptions, amounts, source, money flow, references, and confidence.
 - Runs one combined AI enrichment request for category suggestions, anomaly flags, and a short spending insight.
-- Detects exact duplicates, previously appended transactions, and likely repeated rows caused by overlapping screenshots.
+- Detects exact duplicates, previously appended transactions, and likely repeated rows caused by overlapping screenshots. A transaction already recorded in the matching Google Sheets month tab is automatically marked unchecked, so it will not be appended again unless you deliberately reselect it.
 - Shows duplicate comparisons side by side, including matched fields and archived screenshots where available.
 - Learns deliberate merchant-category decisions locally; the Merchant rules screen lets you inspect, edit, or forget these decisions.
 - Ignores DBS Bank and DBS PayLah PayLah wallet top-ups by default, so internal wallet movements do not become expenses.
 - Ignores UOB TMRW rows starting with `PAYMT THRU E-BANK` by default.
 - Enforces normal transaction signs in the app: outflows are negative and inflows are positive.
-- Creates year workbooks and month tabs automatically, based on each transaction date.
+- Creates year workbooks and month tabs automatically, based on each transaction date. A 2027 transaction creates or uses the `2027` workbook instead of being added to `2026`; the same routing applies to 2028 and every later year.
 - Writes a concise, user-facing A-L Google Sheets ledger and hides non-user-facing processing data.
 - Creates and refreshes a single annual Summary matrix with category rows, month-year columns, year totals, net spend, gross spend, and offsets.
 
@@ -38,9 +38,9 @@ All four inflow categories are shown in the Summary as offsets. They reduce `Net
 1. Upload transaction screenshots in the Streamlit app.
 2. Vision extraction reads each screenshot and produces transaction candidates.
 3. The app normalizes dates, sources, descriptions, categories, and signed amounts.
-4. Duplicate logic compares rows within the upload and against the target Google Sheet period.
+4. Duplicate logic compares rows within the upload and against the target Google Sheet period. Matches already recorded in that month tab are automatically unticked in the review table.
 5. Review the transaction table, correct category, flow, amount, or duplicate decisions, and choose which dates to append.
-6. Confirmed rows are appended to the matching `YYYY` Google Sheets workbook and month tab.
+6. Confirmed rows are appended to the matching `YYYY` Google Sheets workbook and month tab. New years automatically receive their own workbook, while new months create a tab within that year's workbook.
 7. The annual `Summary` tab refreshes automatically.
 
 ## Google Sheets Layout

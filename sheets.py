@@ -649,9 +649,23 @@ class SheetClient:
             {"textFormat": {"bold": False, "fontSize": 12}},
         )
         worksheet.format(
+            f"A{layout['first_variable_row']}:{matrix_end_col}{layout['variable_spend_row']}",
+            {
+                "backgroundColor": {"red": 0.93, "green": 0.96, "blue": 0.98},
+                "textFormat": {"bold": False, "fontSize": 12},
+            },
+        )
+        worksheet.format(
+            f"A{layout['first_fixed_row']}:{matrix_end_col}{layout['fixed_spend_row']}",
+            {
+                "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94},
+                "textFormat": {"bold": False, "fontSize": 12},
+            },
+        )
+        worksheet.format(
             f"A{layout['gross_spend_row']}:{matrix_end_col}{layout['gross_spend_row']}",
             {
-                "backgroundColor": {"red": 0.93, "green": 0.95, "blue": 0.98},
+                "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.82},
                 "textFormat": {"bold": True, "fontSize": 12},
             },
         )
@@ -664,19 +678,6 @@ class SheetClient:
                 {
                     "backgroundColor": color,
                     "textFormat": {"bold": True, "fontSize": 12},
-                },
-            )
-        for fixed_cost_category in ("Insurance", "Subscriptions", "Income Tax"):
-            fixed_cost_row = next(
-                row_index
-                for row_index, row in enumerate(matrix, start=1)
-                if row[0] == fixed_cost_category
-            )
-            worksheet.format(
-                f"A{fixed_cost_row}:{matrix_end_col}{fixed_cost_row}",
-                {
-                    "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94},
-                    "textFormat": {"bold": False, "fontSize": 12},
                 },
             )
         worksheet.format(
@@ -693,17 +694,18 @@ class SheetClient:
                 "textFormat": {"bold": True, "fontSize": 12},
             },
         )
-        worksheet.format(
-            f"A{layout['net_spend_row']}:{matrix_end_col}{layout['net_spend_row']}",
-            {
-                "backgroundColor": {"red": 0.10, "green": 0.49, "blue": 0.40},
-                "textFormat": {
-                    "bold": True,
-                    "fontSize": 12,
-                    "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+        for net_spend_row in (layout["net_spend_row"], layout["bottom_net_spend_row"]):
+            worksheet.format(
+                f"A{net_spend_row}:{matrix_end_col}{net_spend_row}",
+                {
+                    "backgroundColor": {"red": 0.10, "green": 0.49, "blue": 0.40},
+                    "textFormat": {
+                        "bold": True,
+                        "fontSize": 12,
+                        "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                    },
                 },
-            },
-        )
+            )
         worksheet.format(
             f"B:{matrix_end_col}",
             {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}},
@@ -1066,6 +1068,7 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
             + [""]
         )
     matrix.append(["Total Offset (c)", *([""] * len(month_worksheets)), ""])
+    matrix.append(["Net Spend (a + b + c)", *([""] * len(month_worksheets)), ""])
 
     net_spend_row = 2
     first_variable_row = 3
@@ -1078,6 +1081,7 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
     first_offset_row = gross_spend_row + 1
     last_offset_row = first_offset_row + len(offset_categories) - 1
     total_offset_row = last_offset_row + 1
+    bottom_net_spend_row = total_offset_row + 1
     first_month_col = 2
     last_month_col = first_month_col + len(month_worksheets) - 1
     year_total_col = first_month_col + len(month_worksheets)
@@ -1119,6 +1123,9 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
         matrix[total_offset_row - 1][month_index + 1] = (
             f"=SUM({column}{first_offset_row}:{column}{last_offset_row})"
         )
+        matrix[bottom_net_spend_row - 1][month_index + 1] = (
+            f"={column}{gross_spend_row}+{column}{total_offset_row}"
+        )
 
     matrix[gross_spend_row - 1][-1] = _summary_row_total_formula(
         gross_spend_row,
@@ -1135,14 +1142,24 @@ def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[s
         first_month_col,
         last_month_col,
     )
+    matrix[bottom_net_spend_row - 1][-1] = _summary_row_total_formula(
+        bottom_net_spend_row,
+        first_month_col,
+        last_month_col,
+    )
     return matrix, {
+        "first_variable_row": first_variable_row,
+        "last_variable_row": last_variable_row,
         "variable_spend_row": variable_spend_row,
+        "first_fixed_row": first_fixed_row,
+        "last_fixed_row": last_fixed_row,
         "fixed_spend_row": fixed_spend_row,
         "gross_spend_row": gross_spend_row,
         "first_offset_row": first_offset_row,
         "last_offset_row": last_offset_row,
         "total_offset_row": total_offset_row,
         "net_spend_row": net_spend_row,
+        "bottom_net_spend_row": bottom_net_spend_row,
         "year_total_col": year_total_col,
     }
 

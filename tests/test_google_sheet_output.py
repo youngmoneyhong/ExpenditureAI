@@ -204,6 +204,7 @@ class GoogleSheetOutputTests(unittest.TestCase):
                 "Reimbursement",
                 "GVs & Prize Award",
                 "Total Offset (c)",
+                "Net Spend (a + b + c)",
             ],
         )
         carousell_row = next(row for row in matrix if row[0] == "Carousell Sales")
@@ -211,10 +212,12 @@ class GoogleSheetOutputTests(unittest.TestCase):
         self.assertEqual(matrix[layout["gross_spend_row"] - 1][0], "Gross Spend (a + b)")
         self.assertEqual(matrix[layout["total_offset_row"] - 1][0], "Total Offset (c)")
         self.assertEqual(matrix[layout["net_spend_row"] - 1][0], "Net Spend (a + b + c)")
+        self.assertEqual(matrix[layout["bottom_net_spend_row"] - 1][0], "Net Spend (a + b + c)")
         self.assertIn("=SUM(B3:B15)", matrix[layout["variable_spend_row"] - 1][1])
         self.assertIn("=SUM(B17:B19)", matrix[layout["fixed_spend_row"] - 1][1])
         self.assertIn("SUMPRODUCT", matrix[layout["net_spend_row"] - 1][1])
         self.assertNotIn("LOWER(", matrix[layout["net_spend_row"] - 1][1])
+        self.assertEqual(matrix[layout["bottom_net_spend_row"] - 1][1], "=B21+B26")
 
     def test_summary_write_replaces_legacy_content_with_one_matrix(self):
         client = object.__new__(SheetClient)
@@ -226,10 +229,15 @@ class GoogleSheetOutputTests(unittest.TestCase):
 
         ranges = [cell_range for cell_range, _ in summary.updates]
         self.assertFalse(summary.cleared)
-        self.assertEqual(ranges[0], "A1:D26")
+        self.assertEqual(ranges[0], "A1:D27")
         self.assertEqual(summary.frozen, (1, 1))
-        self.assertIn("A27:ZZ1000", summary.cleared_ranges)
-        self.assertIn("E1:ZZ26", summary.cleared_ranges)
+        self.assertIn("A28:ZZ1000", summary.cleared_ranges)
+        self.assertIn("E1:ZZ27", summary.cleared_ranges)
+        formatted = dict(summary.formats)
+        self.assertEqual(formatted["A3:D16"]["backgroundColor"]["blue"], 0.98)
+        self.assertEqual(formatted["A17:D20"]["backgroundColor"]["red"], 0.94)
+        self.assertEqual(formatted["A21:D21"]["backgroundColor"]["blue"], 0.82)
+        self.assertEqual(formatted["A27:D27"]["backgroundColor"]["green"], 0.49)
 
     def test_default_column_widths_are_150_then_100_pixels(self):
         spreadsheet = FakeSpreadsheet([])

@@ -663,7 +663,7 @@ class SheetClient:
                 f"A{summary_row}:{matrix_end_col}{summary_row}",
                 {
                     "backgroundColor": color,
-                    "textFormat": {"bold": False, "fontSize": 12},
+                    "textFormat": {"bold": True, "fontSize": 12},
                 },
             )
         for fixed_cost_category in ("Insurance", "Subscriptions", "Income Tax"):

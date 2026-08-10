@@ -61,6 +61,7 @@ class AppendAudit:
     month: str
     spreadsheet_id: str
     worksheet_title: str
+    worksheet_id: int
     attempted: int
     appended: int
     skipped_duplicates: int
@@ -793,6 +794,7 @@ class SheetClient:
             month=month,
             spreadsheet_id=spreadsheet_id,
             worksheet_title=worksheet.title,
+            worksheet_id=worksheet.id,
             attempted=attempted,
             appended=len(to_append),
             skipped_duplicates=skipped,
@@ -855,6 +857,11 @@ class SheetClient:
             orderBy="name desc",
         ).execute()
         return [file["id"] for file in response.get("files", [])]
+
+
+def worksheet_url(spreadsheet_id: str, worksheet_id: int) -> str:
+    """Build a direct Google Sheets URL for one worksheet tab."""
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={worksheet_id}"
 
 
 def _period_from_date(value: object) -> tuple[int, str]:

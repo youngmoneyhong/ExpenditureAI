@@ -22,7 +22,7 @@ from review_memory import (
     save_review_memory,
     update_merchant_rules,
 )
-from sheets import SheetClient
+from sheets import SheetClient, worksheet_url
 from validators import (
     CATEGORY_OPTIONS,
     EXPENSE_OFFSET_INFLOW_CATEGORIES,
@@ -1674,6 +1674,15 @@ if "transactions_df" in st.session_state:
                 if skipped:
                     st.info(f"Skipped {skipped} duplicate row(s).")
 
+                st.session_state.last_append_tab_links = [
+                    {
+                        "label": f"Open {audit.month} {audit.year} tab",
+                        "url": worksheet_url(audit.spreadsheet_id, audit.worksheet_id),
+                    }
+                    for audit in audits
+                    if audit.appended and audit.verified
+                ]
+
                 audit_rows = [
                     {
                         "year_file": audit.year,
@@ -1691,3 +1700,9 @@ if "transactions_df" in st.session_state:
                 st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
             except Exception as exc:
                 st.error(f"Could not append to Google Sheets: {exc}")
+
+        last_append_tab_links = st.session_state.get("last_append_tab_links", [])
+        if last_append_tab_links:
+            st.markdown("### Open updated Google Sheets")
+            for link in last_append_tab_links:
+                st.link_button(link["label"], link["url"])

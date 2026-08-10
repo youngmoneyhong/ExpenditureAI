@@ -27,6 +27,7 @@ from sheets import (
     _period_from_date,
     _rows_for_worksheet,
     _summary_matrix_rows,
+    worksheet_url,
 )
 from validators import CATEGORY_OPTIONS, GOOGLE_SHEET_COLUMNS, normalize_category, rows_to_dataframe
 from vision_extract import TransactionExtraction
@@ -95,6 +96,12 @@ class FakeSpreadsheet:
 
 
 class GoogleSheetOutputTests(unittest.TestCase):
+    def test_google_sheet_tab_url_targets_the_appended_worksheet(self):
+        self.assertEqual(
+            worksheet_url("spreadsheet-123", 456),
+            "https://docs.google.com/spreadsheets/d/spreadsheet-123/edit#gid=456",
+        )
+
     def test_monthly_ledger_places_category_before_description(self):
         self.assertEqual(
             GOOGLE_SHEET_COLUMNS[:5],

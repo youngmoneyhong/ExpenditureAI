@@ -1,6 +1,6 @@
 # ExpenditureAI
 
-> **A private, review-first AI expense operations layer for bank screenshots.**
+> **My personal project that I developed that leverages on AI expense operations layer for bank screenshots.**
 >
 > Turn DBS Bank, DBS PayLah, and UOB TMRW screenshots into a clean Google Sheets ledger, without rekeying transactions or accidentally double-counting them.
 

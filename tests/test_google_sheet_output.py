@@ -46,6 +46,7 @@ class FakeWorksheet:
         self.cleared = False
         self.cleared_ranges = []
         self.frozen = None
+        self.hidden_columns = []
 
     def get_all_values(self):
         return self.rows
@@ -77,6 +78,9 @@ class FakeWorksheet:
     def add_cols(self, count):
         self.col_count += count
 
+    def hide_columns(self, start, end):
+        self.hidden_columns.append((start, end))
+
 
 class FakeSpreadsheet:
     def __init__(self, worksheets):
@@ -96,6 +100,15 @@ class FakeSpreadsheet:
 
 
 class GoogleSheetOutputTests(unittest.TestCase):
+    def test_extra_ledger_columns_are_hidden_with_zero_based_bounds(self):
+        client = object.__new__(SheetClient)
+        worksheet = FakeWorksheet("June")
+        worksheet.col_count = len(GOOGLE_SHEET_COLUMNS) + 1
+
+        client._hide_internal_columns(worksheet)
+
+        self.assertEqual(worksheet.hidden_columns, [(len(GOOGLE_SHEET_COLUMNS), 13)])
+
     def test_google_sheet_tab_url_targets_the_appended_worksheet(self):
         self.assertEqual(
             worksheet_url("spreadsheet-123", 456),

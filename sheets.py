@@ -239,7 +239,8 @@ class SheetClient:
 
     def _hide_internal_columns(self, worksheet) -> None:
         if worksheet.col_count > len(GOOGLE_SHEET_COLUMNS):
-            worksheet.hide_columns(len(GOOGLE_SHEET_COLUMNS) + 1, worksheet.col_count)
+            # gspread column ranges are zero-based and end-exclusive.
+            worksheet.hide_columns(len(GOOGLE_SHEET_COLUMNS), worksheet.col_count)
 
     def _remove_obsolete_headers(self, worksheet, values: list[list[str]]) -> list[list[str]]:
         if not values:

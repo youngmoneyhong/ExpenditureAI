@@ -40,7 +40,7 @@ flowchart LR
 | Typed transactions from UOB TMRW, DBS Bank, and DBS PayLah screenshots | Inflow/outflow sign rules and category validation | Creates a workbook for each year automatically |
 | Concurrent screenshot processing with bounded workers | Side-by-side duplicate comparison before deciding a genuine repeat | Creates a month tab and summary column when a new month appears |
 | Category suggestions, anomaly flags, and a short spending insight in one enrichment request | Existing Google Sheets matches are automatically unticked | Keeps the annual summary formula-driven and current |
-| Merchant-rule learning with an inspect, edit, and forget screen | Ignores internal PayLah top-ups and UOB e-banking payment rows | Writes a clean user-facing ledger in columns A-L |
+| Merchant-rule learning with an inspect, edit, and forget screen | Ignores internal PayLah top-ups and UOB credit-card settlement transfers | Writes a clean user-facing ledger in columns A-L |
 
 ## System Design
 

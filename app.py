@@ -436,6 +436,20 @@ def is_uob_ebanking_payment(dataframe: pd.DataFrame) -> pd.Series:
     return sources.eq("UOB_TMRW") & descriptions.str.startswith("PAYMT THRU E-BANK")
 
 
+def is_uob_credit_card_bill_payment(dataframe: pd.DataFrame) -> pd.Series:
+    """Identify bank transfers that settle a UOB credit-card bill, not new spending."""
+    sources = dataframe["source"].astype(str).str.upper().str.strip()
+    descriptions = dataframe["description"].apply(normalize_description)
+    flows = dataframe["money_flow"].astype(str).str.lower().str.strip()
+    amounts = pd.to_numeric(dataframe["amount"], errors="coerce").fillna(0)
+    has_uob_credit_card_marker = descriptions.str.contains(
+        r"(?:\bUOB\b.*\b(?:CCRD|CREDIT CARD)\b|\b(?:CCRD|CREDIT CARD)\b.*\bUOB\b)",
+        regex=True,
+    )
+    is_outflow = flows.eq("outflow") | amounts.lt(0)
+    return sources.isin(["DBS_BANK", "UOB_TMRW"]) & is_outflow & has_uob_credit_card_marker
+
+
 def apply_category_flow_rules(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe.empty:
         return dataframe
@@ -579,20 +593,25 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
 
     paylah_topup_mask = is_paylah_wallet_topup(working)
     uob_ebanking_mask = is_uob_ebanking_payment(working)
-    topup_mask = paylah_topup_mask | uob_ebanking_mask
-    working.loc[topup_mask, "status"] = "ignored"
-    working.loc[topup_mask, "include_in_append"] = False
-    working.loc[topup_mask, "ignore_reason"] = "PayLah wallet top-up"
-    working.loc[topup_mask, "review_note"] = "Ignored by default: PayLah wallet top-up"
-    working.loc[topup_mask, "money_flow"] = "neutral"
-    working.loc[topup_mask, "transaction_type"] = "transfer"
-    working.loc[topup_mask, "reimbursement_type"] = "self_transfer"
-    working.loc[topup_mask, "reimbursement_candidate"] = False
-    working.loc[topup_mask, "reimbursement_for"] = ""
-    working.loc[topup_mask, "category"] = "Transfer"
+    uob_credit_card_mask = is_uob_credit_card_bill_payment(working)
+    ignored_transfer_mask = paylah_topup_mask | uob_ebanking_mask | uob_credit_card_mask
+    working.loc[ignored_transfer_mask, "status"] = "ignored"
+    working.loc[ignored_transfer_mask, "include_in_append"] = False
+    working.loc[ignored_transfer_mask, "ignore_reason"] = "PayLah wallet top-up"
+    working.loc[ignored_transfer_mask, "review_note"] = "Ignored by default: PayLah wallet top-up"
+    working.loc[ignored_transfer_mask, "money_flow"] = "neutral"
+    working.loc[ignored_transfer_mask, "transaction_type"] = "transfer"
+    working.loc[ignored_transfer_mask, "reimbursement_type"] = "self_transfer"
+    working.loc[ignored_transfer_mask, "reimbursement_candidate"] = False
+    working.loc[ignored_transfer_mask, "reimbursement_for"] = ""
+    working.loc[ignored_transfer_mask, "category"] = "Transfer"
     working.loc[uob_ebanking_mask, "ignore_reason"] = "UOB e-banking payment"
     working.loc[uob_ebanking_mask, "review_note"] = (
         "Ignored by default: UOB PAYMT THRU E-BANK"
+    )
+    working.loc[uob_credit_card_mask, "ignore_reason"] = "UOB credit-card bill payment"
+    working.loc[uob_credit_card_mask, "review_note"] = (
+        "Ignored by default: UOB credit-card bill payment transfer"
     )
 
     # A flow edit is authoritative: keep its amount sign correct automatically.
@@ -601,7 +620,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     working.loc[flows.eq("outflow"), "amount"] = -amounts[flows.eq("outflow")].abs()
     working.loc[flows.eq("inflow"), "amount"] = amounts[flows.eq("inflow")].abs()
 
-    non_inflow_mask = ~working["money_flow"].astype(str).eq("inflow") & ~topup_mask
+    non_inflow_mask = ~working["money_flow"].astype(str).eq("inflow") & ~ignored_transfer_mask
     working.loc[non_inflow_mask, "reimbursement_candidate"] = False
     working.loc[non_inflow_mask, "reimbursement_type"] = "unknown"
     working.loc[non_inflow_mask, "reimbursement_for"] = ""
@@ -609,7 +628,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     non_reimbursement_inflow_type = (
         working["money_flow"].astype(str).eq("inflow")
         & working["reimbursement_type"].astype(str).eq("cashback")
-        & ~topup_mask
+        & ~ignored_transfer_mask
     )
     working.loc[non_reimbursement_inflow_type, "reimbursement_candidate"] = False
     working.loc[non_reimbursement_inflow_type, "reimbursement_for"] = ""
@@ -624,7 +643,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     paylah_repayment_mask = (
         working["source"].astype(str).eq("DBS_PAYLAH")
         & working["money_flow"].astype(str).eq("inflow")
-        & ~topup_mask
+        & ~ignored_transfer_mask
         & ~non_reimbursement_inflow_type
     )
     working.loc[
@@ -648,11 +667,11 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     working = apply_category_flow_rules(working)
 
     invalid_date_mask = working["date"].apply(lambda value: not is_valid_iso_date(value))
-    working.loc[invalid_date_mask & ~topup_mask, "status"] = "needs_review"
-    working.loc[invalid_date_mask & ~topup_mask, "include_in_append"] = False
-    working.loc[invalid_date_mask & ~topup_mask, "review_note"] = "Fix date before append"
+    working.loc[invalid_date_mask & ~ignored_transfer_mask, "status"] = "needs_review"
+    working.loc[invalid_date_mask & ~ignored_transfer_mask, "include_in_append"] = False
+    working.loc[invalid_date_mask & ~ignored_transfer_mask, "review_note"] = "Fix date before append"
 
-    amount_parse_error_mask = bool_series(working, "amount_parse_error") & ~topup_mask
+    amount_parse_error_mask = bool_series(working, "amount_parse_error") & ~ignored_transfer_mask
     working.loc[amount_parse_error_mask, "status"] = "needs_review"
     working.loc[amount_parse_error_mask, "include_in_append"] = False
     working.loc[amount_parse_error_mask, "review_note"] = (
@@ -667,7 +686,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
             | (flows.eq("inflow") & (amounts <= 0))
             | (flows.eq("neutral") & (amounts != 0))
         )
-        & ~topup_mask
+        & ~ignored_transfer_mask
         & ~amount_parse_error_mask
     )
     working.loc[sign_mismatch_mask, "status"] = "needs_review"
@@ -684,7 +703,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
             | (transaction_keys.duplicated(keep="first") & transaction_keys.ne(""))
             | overlap_duplicate_mask
         )
-        & ~topup_mask
+        & ~ignored_transfer_mask
         & ~invalid_date_mask
         & ~amount_parse_error_mask
         & ~sign_mismatch_mask
@@ -702,7 +721,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     )
 
     advisory_mask = (
-        ~topup_mask
+        ~ignored_transfer_mask
         & ~invalid_date_mask
         & ~amount_parse_error_mask
         & ~sign_mismatch_mask
@@ -733,7 +752,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     if previous_include is not None:
         manual_excluded = (
             previous_include.reindex(working.index, fill_value=True).eq(False)
-            & ~topup_mask
+            & ~ignored_transfer_mask
             & ~duplicate_needs_review
             & ~invalid_date_mask
             & ~already_recorded_mask
@@ -745,7 +764,7 @@ def apply_workflow_state(dataframe: pd.DataFrame) -> pd.DataFrame:
     already_recorded_needs_prompt = (
         already_recorded_mask
         & ~working["duplicate_override"].apply(normalize_bool)
-        & ~topup_mask
+        & ~ignored_transfer_mask
         & ~invalid_date_mask
     )
     working.loc[already_recorded_needs_prompt, "include_in_append"] = False

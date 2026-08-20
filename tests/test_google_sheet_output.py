@@ -390,6 +390,36 @@ class ReimbursementWorkflowTests(unittest.TestCase):
         self.assertEqual(result.at[0, "status"], "ignored")
         self.assertEqual(result.at[0, "ignore_reason"], "UOB e-banking payment")
 
+    def test_uob_credit_card_bill_payment_stays_ignored_without_hiding_carousell_sale(self):
+        dataframe = rows_to_dataframe(
+            [
+                {
+                    "date": "2026-08-20",
+                    "source": "DBS_BANK",
+                    "description": "UOB:4006822041885495:!BANK Transfer CCRD 17869791140383620086 Other transfers FAST / PayNow Transfer ICT",
+                    "amount": "-550.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                },
+                {
+                    "date": "2026-08-20",
+                    "source": "DBS_BANK",
+                    "description": "Carousell P NjwF 20260820SCBLSG22BRT0119722 CSDB FAST / PayNow Transfer ICT",
+                    "amount": "35.00",
+                    "money_flow": "inflow",
+                    "category": "Carousell Sales",
+                },
+            ]
+        )
+
+        result = apply_workflow_state(dataframe)
+
+        self.assertFalse(result.at[0, "include_in_append"])
+        self.assertEqual(result.at[0, "status"], "ignored")
+        self.assertEqual(result.at[0, "ignore_reason"], "UOB credit-card bill payment")
+        self.assertTrue(result.at[1, "include_in_append"])
+        self.assertEqual(result.at[1, "category"], "Carousell Sales")
+
 
 class OverlappingScreenshotDuplicateTests(unittest.TestCase):
     def test_flags_ocr_variants_of_the_same_transaction(self):

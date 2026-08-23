@@ -412,10 +412,11 @@ def is_paylah_wallet_topup(dataframe: pd.DataFrame) -> pd.Series:
     has_wallet_or_paylah = compact_descriptions.str.contains(
         r"\b(?:WALLET|PAYLAH)\b", regex=True
     )
+    explicit_wallet_topup = descriptions.eq("TOP UP MY WALLET")
     paylah_wallet_topup = (
         sources.eq("DBS_PAYLAH")
         & (
-            descriptions.eq("TOP UP MY WALLET")
+            explicit_wallet_topup
             | (has_topup & has_wallet_or_paylah)
         )
     )
@@ -425,7 +426,8 @@ def is_paylah_wallet_topup(dataframe: pd.DataFrame) -> pd.Series:
         & compact_descriptions.str.contains(r"\bPAYLAH\b", regex=True)
     )
     return (
-        paylah_wallet_topup
+        explicit_wallet_topup
+        | paylah_wallet_topup
         | dbs_bank_paylah_topup
     )
 

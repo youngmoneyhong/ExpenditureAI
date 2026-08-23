@@ -370,6 +370,37 @@ class ReimbursementWorkflowTests(unittest.TestCase):
         self.assertFalse(result.at[0, "include_in_append"])
         self.assertEqual(result.at[0, "status"], "ignored")
 
+    def test_paylah_wallet_top_up_is_ignored_but_recipient_payment_stays_included(self):
+        dataframe = rows_to_dataframe(
+            [
+                {
+                    "date": "2026-08-23",
+                    "source": "UNKNOWN",
+                    "description": "Top up my wallet",
+                    "amount": "8.00",
+                    "money_flow": "inflow",
+                    "category": "Others",
+                },
+                {
+                    "date": "2026-08-23",
+                    "source": "DBS_PAYLAH",
+                    "description": "amanda",
+                    "amount": "-8.00",
+                    "money_flow": "outflow",
+                    "category": "Entertainment",
+                },
+            ]
+        )
+
+        result = apply_workflow_state(dataframe)
+
+        self.assertFalse(result.at[0, "include_in_append"])
+        self.assertEqual(result.at[0, "status"], "ignored")
+        self.assertEqual(result.at[0, "category"], "Transfer")
+        self.assertTrue(result.at[1, "include_in_append"])
+        self.assertEqual(result.at[1, "money_flow"], "outflow")
+        self.assertEqual(result.at[1, "amount"], -8.0)
+
     def test_uob_ebanking_payment_stays_ignored(self):
         dataframe = rows_to_dataframe(
             [

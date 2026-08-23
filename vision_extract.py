@@ -96,6 +96,7 @@ Rules:
 - Use DBS_PAYLAH only if the screenshot clearly shows PayLah branding, PayLah wallet, mobile number/name transfers, QR payments, or PayLah transaction language.
 - Use DBS_BANK only for normal DBS/POSB deposit, savings, current, card, or account transactions.
 - Use UOB_TMRW only for UOB TMRW app, UOB account, or UOB card transaction screens.
+- Do not return DBS PayLah "Top up my wallet" rows. They are internal wallet funding transfers, even when shown as a positive green amount. Still return a separate recipient payment below or above it (for example, "amanda") as a negative outflow.
 - Ignore UOB_TMRW transaction rows whose description starts with PAYMT THRU E-BANK.
 - Treat outbound UOB credit-card bill settlements, including UOB BANK Transfer CCRD rows, as neutral transfers rather than expenses.
 - If source is unclear, use UNKNOWN and add a warning.

@@ -3,6 +3,14 @@ setlocal
 
 cd /d "%~dp0"
 
+set "EXISTING_PID="
+for /f %%P in ('powershell -NoProfile -Command "$listener = Get-NetTCPConnection -LocalPort 8501 -State Listen -ErrorAction SilentlyContinue ^| Select-Object -First 1; if ($listener) { $listener.OwningProcess }"') do set "EXISTING_PID=%%P"
+if defined EXISTING_PID (
+    echo ExpenditureAI is already running on port 8501.
+    start "" "http://localhost:8501"
+    exit /b 0
+)
+
 if not exist ".venv\Scripts\python.exe" (
     echo Creating virtual environment in %CD%\.venv
     py -m venv .venv

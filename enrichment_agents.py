@@ -11,7 +11,13 @@ import pandas as pd
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from validators import CATEGORY_OPTIONS, normalize_bool
+from validators import (
+    ALLOCATION_CATEGORIES,
+    CATEGORY_OPTIONS,
+    INFLOW_CATEGORY_OPTIONS,
+    OUTFLOW_CATEGORY_OPTIONS,
+    normalize_bool,
+)
 
 
 class Category(str, Enum):
@@ -22,7 +28,7 @@ class Category(str, Enum):
     GIFTS = "Gifts"
     ENTERTAINMENT = "Entertainment"
     OTHERS = "Others"
-    BILLS = "Bills"
+    BILLS = "Bills / Recurring Commitments"
     EDUCATION = "Education"
     ADMIN_AND_FEES = "Admin & Fees"
     HEALTH = "Health"
@@ -34,8 +40,23 @@ class Category(str, Enum):
     TRANSFER = "Transfer"
     CAROUSELL_SALES = "Carousell Sales"
     CASHBACKS_AND_REFUNDS = "Cashbacks & Refunds"
-    REIMBURSEMENT = "Reimbursement"
+    REIMBURSEMENT = "Reimbursements"
     GVS_AND_PRIZE_AWARD = "GVs & Prize Award"
+    NET_SALARY = "Net Salary"
+    BONUS = "Bonus / AVC / Other Employment Income"
+    CASH_PRIZES = "Prize Awards/Government Vouchers"
+    GIFTS_RECEIVED = "Gifts received"
+    PARENT_ALLOWANCE = "Parent Allowance"
+    ETF = "ETF Contributions"
+    EQUITY = "Equity Contributions"
+    CRYPTO = "Crypto Contributions"
+    COMMODITIES = "Commodities Contributions"
+    CASH_SAVINGS = "Dedicated Cash Savings"
+    OTHER_INVESTMENTS = "Other Investment Contributions"
+    INCOME = "Income"
+    FUNDING = "Funding"
+    INVESTMENTS = "Investments"
+    FAMILY = "Family"
 
 
 class AnomalySeverity(str, Enum):
@@ -90,19 +111,29 @@ Classify each transaction into exactly one allowed category:
 {", ".join(CATEGORY_OPTIONS)}
 
 Rules and examples:
-- Inflow transactions can only use Reimbursement, Carousell Sales, Cashbacks & Refunds, or GVs & Prize Award.
-- Outflow transactions should use spending categories such as Food, Taxi, Public Transport, Shopping, Bills, Subscriptions, Income Tax, Travel, Others, etc.
-- FAIRPRICE, NTUC, COLD STORAGE, SHENG SIONG -> Groceries
+- Inflow category options: {", ".join(INFLOW_CATEGORY_OPTIONS)}.
+- Outflow category options: {", ".join(OUTFLOW_CATEGORY_OPTIONS)}.
+- Net Salary is only salary actually credited after employee CPF, never gross salary or employer CPF.
+- Bonus / AVC / Other Employment Income is cash employment income actually credited.
+- Prize Awards/Government Vouchers includes cash prizes and government-issued vouchers; noncash value is kept separate from spendable cash logic.
+- GVs & Prize Award and Income are legacy ambiguous labels excluded pending clarification. Do not infer historical reclassifications.
+- Legacy Investments and Family also require human clarification; do not reclassify them from memory or assume contributions.
+- Own-account transfers, investment sale proceeds, and withdrawals are not income. Withdrawals use Funding with neutral flow; self-transfers use Transfer.
+- Noncash vouchers and rewards are excluded, never reimbursements or cash income.
+- Allocation categories describe possible new external capital only. The user must explicitly confirm each row before it can be a contribution.
+- Never count both bank and brokerage legs, reinvested proceeds, investment sales, or portfolio rebalancing as new contributions.
+- Category memory cannot provide allocation confirmation or establish whether a legacy award was cash.
+- FAIRPRICE, NTUC, COLD STORAGE, SHENG SIONG -> Food
 - Restaurants, cafes, bars, hawker food, GRABFOOD, FOODPANDA, DELIVEROO -> Food
 - GRAB rides, GOJEK, CDG, taxi -> Taxi
 - MRT, BUS, SimplyGo, TransitLink -> Public Transport
-- DBS PAYLAH personal transfers, wallet top-ups, self transfers -> Transfer
+- Own-account transfers and wallet top-ups -> Transfer; a personal payment is not necessarily a self-transfer.
 - NETFLIX, SPOTIFY, APPLE.COM subscriptions, GOOGLE storage -> Subscriptions
-- Incoming friend payback for a shared bill -> Reimbursement
+- Incoming friend payback for a shared bill -> Reimbursements
 - Carousell buyer payments or marketplace sale proceeds -> Carousell Sales
 - Merchant reversal/refund -> Cashbacks & Refunds
-- Gift voucher, prize, or award received -> GVs & Prize Award
-- If unsure, use Others with low confidence.
+- If an inflow is unknown, use Income with low confidence for review/exclusion, never guess Reimbursements.
+- If an outflow is unknown, use Others with low confidence.
 """
 
 
@@ -111,7 +142,9 @@ ANOMALY_PROMPT = """You are an anomaly detection agent for a personal expense tr
 Flag only rows that deserve human attention. Look for:
 - unusually large amount compared with the uploaded batch
 - positive/negative sign that conflicts with money_flow or transaction_type
-- zero amount
+- zero amount or missing/unreadable amount (missing is not zero)
+- proposed allocation needing confirmation of new external capital counted once
+- noncash or ambiguous legacy income that must be excluded pending clarification
 - unknown source
 - category that appears inconsistent with description
 - likely duplicate within the batch
@@ -242,6 +275,8 @@ def _compact_rows(dataframe: pd.DataFrame) -> list[dict]:
         "source",
         "description",
         "amount",
+        "amount_missing",
+        "allocation_confirmed",
         "currency",
         "money_flow",
         "transaction_type",
@@ -266,7 +301,7 @@ def _category_prompt_with_memory(category_memory: list[dict]) -> str:
     return (
         CATEGORY_PROMPT
         + "\n\nUser-specific memory from previously saved Google Sheet rows. "
-        + "Prefer these patterns over generic examples when they match:\n"
+        + "Use these patterns only when they match and obey the cash-income and allocation rules above:\n"
         + "\n".join(example_lines)
     )
 
@@ -318,6 +353,12 @@ def _apply_category_memory(dataframe: pd.DataFrame, category_memory: list[dict])
 
 
 def _should_skip_memory(row: pd.Series) -> bool:
+    if str(row.get("category", "")) in set(ALLOCATION_CATEGORIES) | {
+        "GVs & Prize Award", "Income", "Funding", "Transfer", "Investments", "Family"
+    } or str(row.get("transaction_type", "")) == "contribution":
+        return True
+    if str(row.get("money_flow", "")).lower() == "inflow":
+        return True
     if normalize_bool(row.get("reimbursement_candidate", False)):
         return True
     if str(row.get("money_flow", "")).lower() == "neutral":
@@ -341,9 +382,14 @@ def _build_category_memory(
     for item in category_memory:
         description = str(item.get("description", "")).strip()
         category = str(item.get("category", "")).strip()
+        category = {"Reimbursement": "Reimbursements", "Bills": "Bills / Recurring Commitments"}.get(category, category)
         flow = str(item.get("money_flow", "")).strip().lower()
         key = _memory_key(description)
         if not key or category not in CATEGORY_OPTIONS:
+            continue
+        if category in set(ALLOCATION_CATEGORIES) | {"GVs & Prize Award", "Income", "Funding", "Transfer", "Investments", "Family"}:
+            continue
+        if flow != "outflow" or category not in OUTFLOW_CATEGORY_OPTIONS:
             continue
         keyed = f"{flow}|{key}"
         by_key[keyed][category] += 1
@@ -419,6 +465,18 @@ def _apply_category_output(dataframe: pd.DataFrame, output: CategoryAgentOutput)
         decision = by_hash.get(str(row["transaction_hash"]))
         if decision is None:
             continue
+        original_category = str(row.get("category", ""))
+        if original_category in {"GVs & Prize Award", "Income", "Funding", "Transfer", "Investments", "Family"}:
+            continue
+        if str(row.get("money_flow", "")) == "neutral":
+            continue
+        if original_category in ALLOCATION_CATEGORIES:
+            continue
+        if decision.category.value in ALLOCATION_CATEGORIES:
+            dataframe.at[index, "allocation_confirmed"] = False
+            dataframe.at[index, "transaction_type"] = "unknown"
+            dataframe.at[index, "include_in_append"] = False
+            dataframe.at[index, "status"] = "needs_review"
         dataframe.at[index, "category"] = decision.category.value
         dataframe.at[index, "category_confidence"] = decision.confidence
         dataframe.at[index, "category_reason"] = decision.reason

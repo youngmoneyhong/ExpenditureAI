@@ -1,18 +1,21 @@
 import unittest
 import os
+import re
 import tempfile
 import threading
 import time
-from unittest.mock import patch
+from copy import deepcopy
+from unittest.mock import Mock, patch
 
 import gspread
 from app import (
     append_preview_metrics,
     apply_category_flow_rules,
-    apply_workflow_state,
+    apply_existing_sheet_duplicate_check,
     apply_workflow_state,
     duplicate_comparisons,
     extract_all,
+    guided_workflow_state,
     overlapping_screenshot_duplicate_mask,
     vision_worker_count,
 )
@@ -37,7 +40,7 @@ class FakeWorksheet:
     def __init__(self, title, rows=None):
         self.title = title
         self.id = abs(hash(title)) % 100000
-        self.rows = rows or [list(GOOGLE_SHEET_COLUMNS)]
+        self.rows = deepcopy(rows) if rows is not None else [list(GOOGLE_SHEET_COLUMNS)]
         self.col_count = len(GOOGLE_SHEET_COLUMNS)
         self.row_count = 1000
         self.formats = []
@@ -49,10 +52,18 @@ class FakeWorksheet:
         self.hidden_columns = []
 
     def get_all_values(self):
-        return self.rows
+        return deepcopy(self.rows)
 
-    def get(self, _range):
-        return self.rows
+    def get(self, cell_range):
+        match = re.fullmatch(r"([A-Z]+)(\d+):\1", cell_range)
+        if not match:
+            return self.rows
+        column = gspread.utils.a1_to_rowcol(f"{match.group(1)}1")[1] - 1
+        start_row = int(match.group(2)) - 1
+        return [
+            [row[column]] if column < len(row) else []
+            for row in self.rows[start_row:]
+        ]
 
     def format(self, cell_range, value):
         self.formats.append((cell_range, value))
@@ -70,13 +81,23 @@ class FakeWorksheet:
         self.frozen = (rows, cols)
 
     def update(self, cell_range, values, **_kwargs):
-        self.updates.append((cell_range, values))
+        self.updates.append((cell_range, deepcopy(values)))
+        start_row, start_col = gspread.utils.a1_to_rowcol(cell_range.split(":")[0])
+        for row_index, incoming in enumerate(values, start_row - 1):
+            while len(self.rows) <= row_index:
+                self.rows.append([])
+            row = self.rows[row_index]
+            row.extend([""] * max(0, start_col - 1 + len(incoming) - len(row)))
+            row[start_col - 1:start_col - 1 + len(incoming)] = deepcopy(incoming)
 
     def columns_auto_resize(self, _start, _end):
         return None
 
     def add_cols(self, count):
         self.col_count += count
+
+    def add_rows(self, count):
+        self.row_count += count
 
     def hide_columns(self, start, end):
         self.hidden_columns.append((start, end))
@@ -86,6 +107,15 @@ class FakeSpreadsheet:
     def __init__(self, worksheets):
         self.worksheets_by_title = {worksheet.title: worksheet for worksheet in worksheets}
         self.batch_updates = []
+        self.conditional_formats = {}
+        self.title = "2026"
+
+    def add_worksheet(self, title, rows, cols):
+        worksheet = FakeWorksheet(title, [])
+        worksheet.row_count = int(rows)
+        worksheet.col_count = int(cols)
+        self.worksheets_by_title[title] = worksheet
+        return worksheet
 
     def worksheet(self, title):
         if title not in self.worksheets_by_title:
@@ -96,10 +126,103 @@ class FakeSpreadsheet:
         return list(self.worksheets_by_title.values())
 
     def batch_update(self, request):
-        self.batch_updates.append(request)
+        self.batch_updates.append(deepcopy(request))
+        for item in request.get("requests", []):
+            if "addConditionalFormatRule" in item:
+                addition = item["addConditionalFormatRule"]
+                rule = deepcopy(addition["rule"])
+                sheet_id = rule["ranges"][0]["sheetId"]
+                self.conditional_formats.setdefault(sheet_id, []).insert(addition["index"], rule)
+            elif "deleteConditionalFormatRule" in item:
+                deletion = item["deleteConditionalFormatRule"]
+                self.conditional_formats[deletion["sheetId"]].pop(deletion["index"])
+
+    def fetch_sheet_metadata(self, params=None):
+        return {"sheets": [
+            {"properties": {"sheetId": sheet_id}, "conditionalFormats": deepcopy(rules)}
+            for sheet_id, rules in self.conditional_formats.items()
+        ]}
 
 
 class GoogleSheetOutputTests(unittest.TestCase):
+    def test_forced_duplicate_check_does_not_reuse_a_stale_miss(self):
+        class SessionState(dict):
+            __getattr__ = dict.get
+            __setattr__ = dict.__setitem__
+
+        dataframe = apply_workflow_state(rows_to_dataframe([{
+            "date": "2026-09-11",
+            "source": "DBS_BANK",
+            "description": "ACCOUNTANT-GENERAL REF123",
+            "amount": "5000.00",
+            "money_flow": "inflow",
+            "category": "Net Salary",
+            "confidence": 0.99,
+        }]))
+        sheet = Mock()
+        sheet.existing_duplicate_matches_by_period.side_effect = [
+            {},
+            {0: {
+                "spreadsheet_id": "year-2026",
+                "worksheet": "September",
+                "worksheet_id": 123,
+                "row": 9,
+                "transaction": {
+                    "date": "2026-09-11",
+                    "description": "ACCOUNTANT-GENERAL REF123",
+                    "amount": "5000.00",
+                    "category": "Net Salary",
+                    "money_flow": "inflow",
+                },
+            }},
+        ]
+
+        with (
+            patch("app.SheetClient.from_env", return_value=sheet),
+            patch("app.st.session_state", SessionState()),
+        ):
+            first = apply_existing_sheet_duplicate_check(dataframe)
+            refreshed = apply_existing_sheet_duplicate_check(first, force_refresh=True)
+
+        self.assertEqual(sheet.existing_duplicate_matches_by_period.call_count, 2)
+        self.assertFalse(refreshed.at[0, "include_in_append"])
+        self.assertEqual(refreshed.at[0, "status"], "needs_review")
+        self.assertEqual(refreshed.at[0, "matched_worksheet"], "September")
+        self.assertEqual(refreshed.at[0, "matched_row"], "9")
+
+    def test_manual_structure_refresh_migrates_categories_and_rebuilds_summary(self):
+        client = object.__new__(SheetClient)
+        client.config = type("Config", (), {"drive_folder_id": "folder"})()
+        month = FakeWorksheet(
+            "June",
+            [
+                list(GOOGLE_SHEET_COLUMNS),
+                ["Yes", "2026-06-01", "DBS", "Equity / ETF Contributions"],
+                ["Yes", "2026-06-02", "DBS", "Money Market Fund Contributions"],
+            ],
+        )
+        year = FakeSpreadsheet([month])
+        year.id = "year-2026"
+        unrelated = FakeSpreadsheet([FakeWorksheet("Data")])
+        unrelated.title = "Notes"
+        unrelated.id = "notes"
+        client.client = type(
+            "Client",
+            (),
+            {"open_by_key": lambda _self, key: {"year-2026": year, "notes": unrelated}[key]},
+        )()
+        client._list_spreadsheets_in_folder = lambda: ["year-2026", "notes"]
+
+        audits = client.refresh_existing_workbook_structures()
+
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].year, "2026")
+        self.assertEqual(audits[0].month_tabs, 1)
+        self.assertEqual(audits[0].migrated_categories, 2)
+        self.assertEqual(month.rows[1][3], "ETF Contributions")
+        self.assertEqual(month.rows[2][3], "Other Investment Contributions")
+        self.assertEqual(year.worksheet("Summary").updates[0][0], "A1:C47")
+
     def test_extra_ledger_columns_are_hidden_with_zero_based_bounds(self):
         client = object.__new__(SheetClient)
         worksheet = FakeWorksheet("June")
@@ -150,9 +273,9 @@ class GoogleSheetOutputTests(unittest.TestCase):
         formula = _checked_category_summary_formula(FakeWorksheet("June"))
 
         self.assertIn("Offsets Received", formula)
-        self.assertIn('"Carousell Sales"', formula)
+        self.assertNotIn('"Carousell Sales"', formula)
         self.assertIn('"Cashbacks & Refunds"', formula)
-        self.assertIn('"Reimbursement"', formula)
+        self.assertIn('"Reimbursements"', formula)
         self.assertNotIn("reimbursement_for_category", formula)
         self.assertNotIn("reimbursement_candidate", formula)
         self.assertEqual(formula.count("("), formula.count(")"))
@@ -187,77 +310,43 @@ class GoogleSheetOutputTests(unittest.TestCase):
         self.assertEqual(_period_from_date("2027-01-03"), (2027, "January"))
         self.assertEqual(_period_from_date("2028-12-31"), (2028, "December"))
 
-    def test_summary_matrix_has_month_year_columns_and_net_spend(self):
+    def test_summary_matrix_delegates_to_financial_statement(self):
+        from financial_statement import statement_matrix
+
+        worksheets = [FakeWorksheet("June"), FakeWorksheet("Jul"), FakeWorksheet("Aug")]
+        statuses = {"June": 2, "Jul": 3, "Aug": 4}
         matrix, layout = _summary_matrix_rows(
-            [FakeWorksheet("June"), FakeWorksheet("Jul"), FakeWorksheet("Aug")],
-            "2026",
+            worksheets, "2026", salary_status_rows=statuses,
         )
 
         self.assertEqual(matrix[0], ["Category", "Jun 2026", "Jul 2026", "Aug 2026", "Year Total"])
-        self.assertEqual(matrix[1][0], "Net Spend (a + b + c)")
-        self.assertEqual(
-            [row[0] for row in matrix],
-            [
-                "Category",
-                "Net Spend (a + b + c)",
-                "Food",
-                "Public Transport",
-                "Taxi",
-                "Shopping",
-                "Gifts",
-                "Entertainment",
-                "Travel",
-                "Health",
-                "Personal Care",
-                "Education",
-                "Bills",
-                "Admin & Fees",
-                "Others",
-                "Variable Spend (a)",
-                "Insurance",
-                "Subscriptions",
-                "Income Tax",
-                "Fixed Spend (b)",
-                "Gross Spend (a + b)",
-                "Carousell Sales",
-                "Cashbacks & Refunds",
-                "Reimbursement",
-                "GVs & Prize Award",
-                "Total Offset (c)",
-                "Net Spend (a + b + c)",
-            ],
-        )
-        carousell_row = next(row for row in matrix if row[0] == "Carousell Sales")
-        self.assertTrue(carousell_row[1].startswith("=-IFERROR"))
-        self.assertEqual(matrix[layout["gross_spend_row"] - 1][0], "Gross Spend (a + b)")
-        self.assertEqual(matrix[layout["total_offset_row"] - 1][0], "Total Offset (c)")
-        self.assertEqual(matrix[layout["net_spend_row"] - 1][0], "Net Spend (a + b + c)")
-        self.assertEqual(matrix[layout["bottom_net_spend_row"] - 1][0], "Net Spend (a + b + c)")
-        self.assertIn("=SUM(B3:B15)", matrix[layout["variable_spend_row"] - 1][1])
-        self.assertIn("=SUM(B17:B19)", matrix[layout["fixed_spend_row"] - 1][1])
-        self.assertIn("SUMPRODUCT", matrix[layout["net_spend_row"] - 1][1])
-        self.assertNotIn("LOWER(", matrix[layout["net_spend_row"] - 1][1])
-        self.assertEqual(matrix[layout["bottom_net_spend_row"] - 1][1], "=B21+B26")
+        self.assertEqual((matrix, layout), statement_matrix(worksheets, "2026", salary_status_rows=statuses))
 
     def test_summary_write_replaces_legacy_content_with_one_matrix(self):
         client = object.__new__(SheetClient)
         spreadsheet = FakeSpreadsheet([FakeWorksheet("June"), FakeWorksheet("Jul")])
         spreadsheet.title = "2026"
-        summary = FakeWorksheet("Summary")
+        legacy_rows = [["Category", "Jun 2026", "Jul 2026", "Aug 2026", "Year Total"]]
+        legacy_rows.extend([[""] * 5 for _ in range(26)])
+        legacy_rows[26][0] = "Net Spend (a + b + c)"
+        summary = FakeWorksheet("Summary", legacy_rows)
 
         client._write_year_summary(summary, spreadsheet)
 
         ranges = [cell_range for cell_range, _ in summary.updates]
         self.assertFalse(summary.cleared)
-        self.assertEqual(ranges[0], "A1:D27")
+        self.assertEqual(ranges[0], "A1:D47")
         self.assertEqual(summary.frozen, (1, 1))
-        self.assertIn("A28:ZZ1000", summary.cleared_ranges)
-        self.assertIn("E1:ZZ27", summary.cleared_ranges)
-        formatted = dict(summary.formats)
-        self.assertEqual(formatted["A3:D16"]["backgroundColor"]["blue"], 0.98)
-        self.assertEqual(formatted["A17:D20"]["backgroundColor"]["red"], 0.94)
-        self.assertEqual(formatted["A21:D21"]["backgroundColor"]["blue"], 0.82)
-        self.assertEqual(formatted["A27:D27"]["backgroundColor"]["green"], 0.49)
+        self.assertEqual(summary.cleared_ranges, ["E1:E27"])
+        formatted = {}
+        for item in summary.batch_formats:
+            formatted.setdefault(item["range"], {}).update(item["format"])
+        self.assertEqual(formatted["A2:D2"]["backgroundColor"]["blue"], 0.43)
+        self.assertEqual(formatted["A30:D30"]["backgroundColor"], formatted["A29:D29"]["backgroundColor"])
+        self.assertEqual(formatted["A37:D37"]["backgroundColor"]["green"], 0.49)
+        self.assertEqual(formatted["A37"]["backgroundColor"]["blue"], 0.96)
+        self.assertEqual(formatted["A47:D47"]["backgroundColor"]["green"], 0.49)
+        self.assertEqual(formatted["A47"]["backgroundColor"]["blue"], 0.96)
 
     def test_default_column_widths_are_150_then_100_pixels(self):
         spreadsheet = FakeSpreadsheet([])
@@ -316,13 +405,13 @@ class ReimbursementWorkflowTests(unittest.TestCase):
 
         self.assertTrue(result.at[0, "include_in_append"])
         self.assertEqual(result.at[0, "status"], "ready")
-        self.assertEqual(result.at[0, "category"], "Reimbursement")
+        self.assertEqual(result.at[0, "category"], "Reimbursements")
         self.assertEqual(result.at[0, "reimbursement_for"], "")
         self.assertEqual(result.at[0, "reimbursement_for_category"], "")
         self.assertEqual(preview["offsets"], 18.0)
         self.assertEqual(preview["net_spend"], -18.0)
 
-    def test_carousell_sales_and_refunds_offset_net_spend(self):
+    def test_carousell_sales_are_income_and_only_refunds_offset_net_spend(self):
         dataframe = rows_to_dataframe(
             [
                 {
@@ -348,8 +437,10 @@ class ReimbursementWorkflowTests(unittest.TestCase):
 
         preview = append_preview_metrics(apply_workflow_state(dataframe))
 
-        self.assertEqual(preview["offsets"], 35.0)
-        self.assertEqual(preview["net_spend"], -35.0)
+        self.assertEqual(preview["income"], 25.0)
+        self.assertEqual(preview["offsets"], 10.0)
+        self.assertEqual(preview["net_spend"], -10.0)
+        self.assertEqual(preview["operating"], 35.0)
 
     def test_dbs_bank_paylah_top_up_stays_ignored(self):
         dataframe = rows_to_dataframe(
@@ -451,6 +542,114 @@ class ReimbursementWorkflowTests(unittest.TestCase):
         self.assertTrue(result.at[1, "include_in_append"])
         self.assertEqual(result.at[1, "category"], "Carousell Sales")
 
+    def test_same_topup_words_from_another_bank_are_not_auto_ignored(self):
+        dataframe = rows_to_dataframe([{
+            "date": "2026-06-04", "source": "UOB_TMRW",
+            "description": "TOP UP MY WALLET", "amount": "-8.00",
+            "money_flow": "outflow", "category": "Others", "confidence": .95,
+        }])
+        result = apply_workflow_state(dataframe)
+        self.assertTrue(result.at[0, "include_in_append"])
+        self.assertNotEqual(result.at[0, "status"], "ignored")
+
+    def test_known_merchants_are_classified_deterministically(self):
+        dataframe = rows_to_dataframe(
+            [
+                {
+                    "date": "2026-06-04",
+                    "source": "DBS_BANK",
+                    "description": "BUS/MRT SINGAPORE",
+                    "amount": "1.09",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-06-25",
+                    "source": "DBS_BANK",
+                    "description": "ACCOUNTANT-GENERAL",
+                    "amount": "-5000.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-06-30",
+                    "source": "DBS_BANK",
+                    "description": "IBG GOV GOV",
+                    "amount": "-200.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-07-01",
+                    "source": "DBS_BANK",
+                    "description": "MINDEF SAF",
+                    "amount": "-100.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-07-02",
+                    "source": "DBS_BANK",
+                    "description": "INTERACTIVE BROKERS PART",
+                    "amount": "1200.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-07-03",
+                    "source": "DBS_BANK",
+                    "description": "TIGER BROKERS SINGAPORE PTE LTD",
+                    "amount": "800.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+                {
+                    "date": "2026-07-04",
+                    "source": "DBS_BANK",
+                    "description": "MOOMOO SG",
+                    "amount": "600.00",
+                    "money_flow": "outflow",
+                    "category": "Others",
+                    "confidence": 0.95,
+                },
+            ]
+        )
+
+        result = apply_workflow_state(dataframe)
+
+        self.assertEqual(result.at[0, "category"], "Public Transport")
+        self.assertEqual(result.at[0, "money_flow"], "outflow")
+        self.assertEqual(result.at[0, "amount"], -1.09)
+        self.assertEqual(result.at[1, "category"], "Net Salary")
+        self.assertEqual(result.at[1, "money_flow"], "inflow")
+        self.assertEqual(result.at[1, "amount"], 5000.0)
+        self.assertEqual(result.at[2, "category"], "Prize Awards/Government Vouchers")
+        self.assertEqual(result.at[2, "money_flow"], "inflow")
+        self.assertEqual(result.at[2, "amount"], 200.0)
+        self.assertEqual(result.at[3, "category"], "Prize Awards/Government Vouchers")
+        self.assertEqual(result.at[3, "money_flow"], "inflow")
+        self.assertEqual(result.at[3, "amount"], 100.0)
+        self.assertEqual(result.at[4, "category"], "ETF Contributions")
+        self.assertEqual(result.at[4, "money_flow"], "outflow")
+        self.assertEqual(result.at[4, "amount"], -1200.0)
+        self.assertEqual(result.at[4, "status"], "needs_review")
+        self.assertFalse(result.at[4, "include_in_append"])
+        self.assertFalse(result.at[4, "allocation_confirmed"])
+        for row in [5, 6]:
+            self.assertEqual(result.at[row, "category"], "Equity Contributions")
+            self.assertEqual(result.at[row, "money_flow"], "outflow")
+            self.assertLess(result.at[row, "amount"], 0)
+            self.assertEqual(result.at[row, "status"], "needs_review")
+            self.assertFalse(result.at[row, "include_in_append"])
+            self.assertFalse(result.at[row, "allocation_confirmed"])
+        self.assertTrue(result.loc[:3, "include_in_append"].all())
+
 
 class OverlappingScreenshotDuplicateTests(unittest.TestCase):
     def test_flags_ocr_variants_of_the_same_transaction(self):
@@ -529,6 +728,34 @@ class OverlappingScreenshotDuplicateTests(unittest.TestCase):
         self.assertFalse(overlapping_screenshot_duplicate_mask(dataframe).any())
         self.assertTrue(result["include_in_append"].all())
 
+    def test_different_references_keep_identical_payments_distinct(self):
+        common = {
+            "date": "2026-06-04", "source": "DBS_PAYLAH", "description": "AMANDA",
+            "amount": "-8.00", "money_flow": "outflow", "category": "Food", "confidence": .95,
+        }
+        dataframe = rows_to_dataframe([
+            {**common, "transaction_reference": "PAY-001"},
+            {**common, "transaction_reference": "PAY-002"},
+        ])
+        result = apply_workflow_state(dataframe)
+        self.assertTrue(result["include_in_append"].all())
+        self.assertEqual(duplicate_comparisons(dataframe), [])
+
+    def test_possible_two_leg_allocations_require_a_separate_decision(self):
+        dataframe = rows_to_dataframe([
+            {"date": "2026-06-04", "source": "DBS_BANK", "description": "TRANSFER TO BROKER",
+             "amount": "-2000", "currency": "SGD", "money_flow": "outflow",
+             "category": "ETF Contributions", "allocation_confirmed": True, "confidence": .95},
+            {"date": "2026-06-05", "source": "BROKER", "description": "BUY ETF",
+             "amount": "-2000", "currency": "SGD", "money_flow": "outflow",
+             "category": "ETF Contributions", "allocation_confirmed": True, "confidence": .95},
+        ])
+        result = apply_workflow_state(dataframe)
+        self.assertTrue(result.at[0, "include_in_append"])
+        self.assertFalse(result.at[1, "include_in_append"])
+        self.assertIn("Duplicate-looking", result.at[1, "review_note"])
+        self.assertIn("second leg", duplicate_comparisons(dataframe)[0]["reason"])
+
 
 class MerchantRuleTests(unittest.TestCase):
     def test_can_edit_and_forget_a_merchant_rule(self):
@@ -562,6 +789,43 @@ class MerchantRuleTests(unittest.TestCase):
 
 
 class PerformanceWorkflowTests(unittest.TestCase):
+    def test_failed_screenshot_does_not_discard_successful_results(self):
+        class UploadedFile:
+            def __init__(self, name):
+                self.name = name
+
+            def seek(self, _offset):
+                return None
+
+            def getbuffer(self):
+                return b"test image"
+
+        successful = TransactionExtraction.model_validate({
+            "detected_source": "DBS_BANK", "statement_period": "",
+            "transactions": [], "warnings": [],
+        })
+        uploads = [UploadedFile("good.png"), UploadedFile("bad.png")]
+        with (
+            patch("app.extract_transactions_from_image", side_effect=[successful, RuntimeError("unreadable")]),
+            patch("app.st.progress"),
+        ):
+            result = extract_all(
+                uploads, "gpt-4.1-mini", archive_screenshots=False,
+                save_raw_text=False, run_category_agent=False,
+                run_anomaly_agent=False, run_insight_agent=False,
+            )
+        self.assertTrue(result.empty)
+        statuses = [state["status"] for state in __import__("app").st.session_state.screenshot_states.values()]
+        self.assertEqual(sorted(statuses), ["Failed", "Ready"])
+
+    def test_guided_states_are_derived_without_replacing_rule_status(self):
+        dataframe = rows_to_dataframe([
+            {"date": "2026-09-01", "source": "DBS_BANK", "description": "A", "amount": -1, "money_flow": "outflow", "category": "Food", "status": "ready"},
+            {"date": "2026-09-02", "source": "DBS_BANK", "description": "B", "amount": -1, "money_flow": "outflow", "category": "Food", "status": "needs_review", "include_in_append": False},
+            {"date": "2026-09-03", "source": "DBS_BANK", "description": "C", "amount": 0, "money_flow": "neutral", "category": "Transfer", "status": "ignored", "include_in_append": False},
+        ])
+        self.assertEqual(guided_workflow_state(dataframe).tolist(), ["ready", "needs_attention", "excluded"])
+
     def test_vision_concurrency_is_bounded_and_configurable(self):
         with patch.dict(os.environ, {"VISION_CONCURRENCY": "4"}):
             self.assertEqual(vision_worker_count(8), 4)
@@ -675,7 +939,6 @@ class CategoryMigrationTests(unittest.TestCase):
             "Auto & Parking",
             "Business",
             "Cash & Cheque",
-            "Family",
             "Fuel",
             "Groceries",
             "Kids",
@@ -683,7 +946,6 @@ class CategoryMigrationTests(unittest.TestCase):
             "Pets",
             "Cash Withdrawal",
             "Rental",
-            "Investments",
         }
 
         self.assertEqual(normalize_category("Gifts & Charity"), "Gifts")
@@ -691,6 +953,16 @@ class CategoryMigrationTests(unittest.TestCase):
         for category in removed:
             self.assertEqual(normalize_category(category), "Others")
             self.assertNotIn(category, CATEGORY_OPTIONS)
+
+    def test_ambiguous_legacy_categories_are_retained_for_review(self):
+        for category in ["Family", "Investments", "GVs & Prize Award", "Income", "Funding"]:
+            with self.subTest(category=category):
+                self.assertEqual(normalize_category(category), category)
+                self.assertIn(category, CATEGORY_OPTIONS)
+
+    def test_unambiguous_statement_aliases_are_normalized(self):
+        self.assertEqual(normalize_category("Bills"), "Bills / Recurring Commitments")
+        self.assertEqual(normalize_category("Reimbursement"), "Reimbursements")
 
 
 class FlowRulesTests(unittest.TestCase):
@@ -720,7 +992,9 @@ class FlowRulesTests(unittest.TestCase):
 
         self.assertEqual(result.at[0, "amount"], -12.5)
         self.assertEqual(result.at[1, "amount"], 20.0)
-        self.assertEqual(result.at[1, "category"], "Reimbursement")
+        self.assertEqual(result.at[1, "category"], "Food")
+        self.assertEqual(result.at[1, "status"], "needs_review")
+        self.assertFalse(result.at[1, "include_in_append"])
 
 
 if __name__ == "__main__":

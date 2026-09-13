@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -14,13 +15,19 @@ from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
 from validators import (
+    ALLOCATION_CATEGORIES,
     CATEGORY_MIGRATIONS,
+    FIXED_EXPENSE_CATEGORIES,
+    INCOME_CATEGORIES,
+    OFFSET_CATEGORIES,
+    VARIABLE_EXPENSE_CATEGORIES,
     CATEGORY_OPTIONS,
     EXPENSE_OFFSET_INFLOW_CATEGORIES,
     GOOGLE_SHEET_COLUMNS,
     INFLOW_CATEGORY_OPTIONS,
     OUTFLOW_CATEGORY_OPTIONS,
     normalize_amount,
+    normalize_amount_with_error,
     normalize_bool,
 )
 
@@ -34,6 +41,10 @@ APP_DIR = Path(__file__).resolve().parent
 OBSOLETE_SHEET_COLUMNS = ["transaction_time"]
 SUMMARY_WORKSHEET_TITLE = "Summary"
 CATEGORY_VALIDATION_WORKSHEET_TITLE = "_Category Validation"
+STATEMENT_REVIEW_WORKSHEET_TITLE = "Statement Review"
+STATEMENT_ISSUES_WORKSHEET_TITLE = "Statement Issues"
+SALARY_STATUS_OPTIONS = ["Pending", "Confirmed zero", "Historical zero"]
+LEGACY_CATEGORY_ALIASES = {"Bills": "Bills / Recurring Commitments", "Reimbursement": "Reimbursements"}
 
 
 @dataclass
@@ -69,6 +80,15 @@ class AppendAudit:
     missing_hashes: list[str]
     created_spreadsheet: bool = False
     created_worksheet: bool = False
+
+
+@dataclass
+class WorkbookRefreshAudit:
+    year: str
+    spreadsheet_id: str
+    summary_worksheet_id: int
+    month_tabs: int
+    migrated_categories: int
 
 
 def _resolve_service_account_path(path_value: str | None) -> Path:
@@ -148,6 +168,13 @@ class SheetClient:
         self._apply_dropdowns(spreadsheet, worksheet)
         self._apply_transaction_table_format(worksheet, spreadsheet=spreadsheet)
         return worksheet, created
+
+    def _get_or_create_append_worksheet(self, spreadsheet, title: str):
+        """Use existing month tabs without repeating expensive structure styling."""
+        try:
+            return spreadsheet.worksheet(title), False
+        except gspread.WorksheetNotFound:
+            return self._get_or_create_worksheet(spreadsheet, title)
 
     def _get_or_create_summary_worksheet(self, spreadsheet):
         try:
@@ -293,13 +320,24 @@ class SheetClient:
                 _dropdown_request(
                     worksheet_id=worksheet.id,
                     column_index=category_index,
-                    options=CATEGORY_OPTIONS,
+                    options=list(dict.fromkeys([
+                        *CATEGORY_OPTIONS,
+                        *LEGACY_CATEGORY_ALIASES.keys(),
+                        "Transfer",
+                    ])),
                     message=(
-                        "Inflow: Carousell Sales, Cashbacks & Refunds, Reimbursement, "
-                        "or GVs & Prize Award. Outflow: an expense category."
+                        "Choose a category. Inflow and outflow compatibility is checked "
+                        "before append."
                     ),
                 )
             )
+
+        if "amount" in headers and "money_flow" in headers:
+            requests.append(_amount_sign_validation_request(
+                worksheet_id=worksheet.id,
+                amount_column_index=headers.index("amount"),
+                flow_column_index=headers.index("money_flow"),
+            ))
 
         if "check" in headers:
             check_index = headers.index("check")
@@ -328,22 +366,33 @@ class SheetClient:
         spreadsheet.batch_update({"requests": requests})
 
     def _ensure_category_validation_worksheet(self, spreadsheet):
+        outflow_options = list(dict.fromkeys([
+            *OUTFLOW_CATEGORY_OPTIONS,
+            *[old for old, new in LEGACY_CATEGORY_ALIASES.items() if new in OUTFLOW_CATEGORY_OPTIONS],
+        ]))
+        inflow_options = list(dict.fromkeys([
+            *INFLOW_CATEGORY_OPTIONS,
+            *[old for old, new in LEGACY_CATEGORY_ALIASES.items() if new in INFLOW_CATEGORY_OPTIONS],
+        ]))
         try:
             worksheet = spreadsheet.worksheet(CATEGORY_VALIDATION_WORKSHEET_TITLE)
         except gspread.WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(
                 title=CATEGORY_VALIDATION_WORKSHEET_TITLE,
-                rows=max(len(OUTFLOW_CATEGORY_OPTIONS), len(INFLOW_CATEGORY_OPTIONS)) + 1,
+                rows=max(len(outflow_options), len(inflow_options)) + 1,
                 cols=3,
             )
+        _ensure_min_rows(
+            worksheet, len(CATEGORY_OPTIONS) + len(LEGACY_CATEGORY_ALIASES) + 1
+        )
 
         values = [["Outflow", "Inflow", "Neutral"]]
-        height = max(len(OUTFLOW_CATEGORY_OPTIONS), len(INFLOW_CATEGORY_OPTIONS))
+        height = max(len(outflow_options), len(inflow_options))
         values.extend(
             [
                 [
-                    OUTFLOW_CATEGORY_OPTIONS[index] if index < len(OUTFLOW_CATEGORY_OPTIONS) else "",
-                    INFLOW_CATEGORY_OPTIONS[index] if index < len(INFLOW_CATEGORY_OPTIONS) else "",
+                    outflow_options[index] if index < len(outflow_options) else "",
+                    inflow_options[index] if index < len(inflow_options) else "",
                     "Transfer" if index == 0 else "",
                 ]
                 for index in range(height)
@@ -398,10 +447,59 @@ class SheetClient:
                 )
 
             key = _transaction_duplicate_key(row)
-            if key and key in cache[period]:
+            allocation_key = _allocation_collision_key(row)
+            if (key and key in cache[period]) or (
+                allocation_key and allocation_key in cache[period]
+            ):
                 mask.at[index] = True
 
         return mask
+
+    def existing_duplicate_matches_by_period(self, dataframe: pd.DataFrame) -> dict:
+        """Return matched ledger evidence keyed by incoming DataFrame index."""
+        matches = {}
+        if dataframe.empty or not self.config.drive_folder_id:
+            return matches
+        cache = {}
+        for index, incoming in dataframe.iterrows():
+            try:
+                year, month = _period_from_date(incoming.get("date", ""))
+            except ValueError:
+                continue
+            period = (str(year), month)
+            if period not in cache:
+                spreadsheet_id = self._find_spreadsheet_in_folder(str(year))
+                if not spreadsheet_id:
+                    cache[period] = ("", None, [])
+                else:
+                    spreadsheet = self.client.open_by_key(spreadsheet_id)
+                    try:
+                        worksheet = spreadsheet.worksheet(month)
+                        cache[period] = (
+                            spreadsheet_id,
+                            worksheet.id,
+                            _transaction_records_with_rows(worksheet),
+                        )
+                    except gspread.WorksheetNotFound:
+                        cache[period] = (spreadsheet_id, None, [])
+            spreadsheet_id, worksheet_id, candidates = cache[period]
+            incoming_key = _transaction_duplicate_key(incoming)
+            allocation_key = _allocation_collision_key(incoming)
+            for row_number, candidate in candidates:
+                if (
+                    incoming_key and incoming_key == _transaction_duplicate_key(candidate)
+                ) or (
+                    allocation_key and allocation_key == _allocation_collision_key(candidate)
+                ):
+                    matches[index] = {
+                        "spreadsheet_id": spreadsheet_id,
+                        "worksheet": month,
+                        "worksheet_id": worksheet_id,
+                        "row": row_number,
+                        "transaction": candidate,
+                    }
+                    break
+        return matches
 
     def _existing_duplicate_keys_for_period(self, *, year: str, month: str) -> set[str]:
         spreadsheet_id = self._find_spreadsheet_in_folder(year)
@@ -425,6 +523,8 @@ class SheetClient:
                     if worksheet.title in {
                         SUMMARY_WORKSHEET_TITLE,
                         CATEGORY_VALIDATION_WORKSHEET_TITLE,
+                        STATEMENT_REVIEW_WORKSHEET_TITLE,
+                        STATEMENT_ISSUES_WORKSHEET_TITLE,
                     }:
                         continue
                     records.extend(_category_records_from_worksheet(worksheet))
@@ -454,6 +554,7 @@ class SheetClient:
     ) -> list[AppendAudit]:
         if dataframe.empty:
             return []
+        _validate_append_transactions(dataframe)
         if not self.config.drive_folder_id:
             return [self._append_legacy_with_audit(dataframe, skip_duplicates=skip_duplicates)]
 
@@ -471,7 +572,9 @@ class SheetClient:
         ):
             group = group.drop(columns=["_period"])
             spreadsheet, created_spreadsheet = self._get_or_create_year_spreadsheet(str(year))
-            worksheet, created_worksheet = self._get_or_create_worksheet(spreadsheet, month)
+            worksheet, created_worksheet = self._get_or_create_append_worksheet(
+                spreadsheet, month
+            )
             audit = self._append_group_with_audit(
                 worksheet=worksheet,
                 dataframe=group,
@@ -484,24 +587,105 @@ class SheetClient:
             )
             audits.append(audit)
 
-        for year in sorted({audit.year for audit in audits if audit.year != "single"}):
+        years_requiring_structure_refresh = {
+            audit.year
+            for audit in audits
+            if audit.year != "single"
+            and (audit.created_spreadsheet or audit.created_worksheet)
+        }
+        for year in sorted(years_requiring_structure_refresh):
             spreadsheet, _ = self._get_or_create_year_spreadsheet(year)
             self.refresh_year_summary(spreadsheet)
 
         return audits
 
     def refresh_year_summary(self, spreadsheet) -> None:
+        month_worksheets = self._month_worksheets(spreadsheet)
         summary = self._get_or_create_summary_worksheet(spreadsheet)
-        for month_worksheet in self._month_worksheets(spreadsheet):
-            month_values = month_worksheet.get_all_values()
-            if month_values:
-                self._ensure_headers(spreadsheet, month_worksheet, month_values[0])
-            self._hide_internal_columns(month_worksheet)
-            self._migrate_category_labels(month_worksheet)
-            self._normalize_month_ledger_values(month_worksheet)
+        for month_worksheet in month_worksheets:
             self._apply_dropdowns(spreadsheet, month_worksheet)
             self._apply_transaction_table_format(month_worksheet, spreadsheet=spreadsheet)
         self._write_year_summary(summary, spreadsheet)
+
+    def refresh_existing_workbook_structures(self) -> list[WorkbookRefreshAudit]:
+        """Refresh existing year workbooks without changing transaction amounts or rows."""
+        if self.config.drive_folder_id:
+            spreadsheets = [
+                self.client.open_by_key(spreadsheet_id)
+                for spreadsheet_id in self._list_spreadsheets_in_folder()
+            ]
+        elif self.spreadsheet is not None:
+            spreadsheets = [self.spreadsheet]
+        else:
+            return []
+
+        audits = []
+        for spreadsheet in spreadsheets:
+            title = str(getattr(spreadsheet, "title", "")).strip()
+            if self.config.drive_folder_id and not re.fullmatch(r"\d{4}", title):
+                continue
+            month_worksheets = self._month_worksheets(spreadsheet)
+            if not month_worksheets:
+                continue
+
+            migrated = sum(
+                self._migrate_category_labels(worksheet)
+                for worksheet in month_worksheets
+            )
+            self.refresh_year_summary(spreadsheet)
+            summary = self._get_or_create_summary_worksheet(spreadsheet)
+            audits.append(
+                WorkbookRefreshAudit(
+                    year=title or "Workbook",
+                    spreadsheet_id=spreadsheet.id,
+                    summary_worksheet_id=summary.id,
+                    month_tabs=len(month_worksheets),
+                    migrated_categories=migrated,
+                )
+            )
+        return audits
+
+    def _write_statement_issues(self, spreadsheet, month_worksheets) -> None:
+        from financial_statement import statement_issues, style_review_sheet
+
+        year = _summary_year_label(spreadsheet.title)
+        matrix = [["Month", "Ledger Row", "Date", "Category", "Issue"]]
+        for month in month_worksheets:
+            values = month.get_all_values()
+            if not values:
+                continue
+            # Keep blank/invalid-date rows so the audit retains actual ledger row numbers.
+            records = [
+                {header: value for header, value in zip(values[0], row) if header}
+                for row in values[1:]
+            ]
+            matrix.extend(
+                [month.title, *issue]
+                for issue in statement_issues(records, year, _month_number_from_title(month.title))
+            )
+        try:
+            audit = spreadsheet.worksheet(STATEMENT_ISSUES_WORKSHEET_TITLE)
+        except gspread.WorksheetNotFound:
+            audit = spreadsheet.add_worksheet(
+                title=STATEMENT_ISSUES_WORKSHEET_TITLE, rows=100, cols=8
+            )
+        old = audit.get_all_values()
+        if old and any(old[0]) and old[0][:5] != matrix[0]:
+            raise ValueError("Statement Issues has an unrecognized header; preserve it before migration.")
+        old_height = 0
+        if old and len(old[0]) >= 8 and old[0][6] == "Generated rows":
+            old_height = int(old[0][7])
+            if not 1 <= old_height <= audit.row_count:
+                raise ValueError("Statement Issues has an invalid generated footprint.")
+        elif old and any(any(row[6:8]) for row in old):
+            raise ValueError("Statement Issues G:H contains notes; relocate them before migration.")
+        _ensure_min_columns(audit, 8)
+        _ensure_min_rows(audit, len(matrix))
+        audit.update(f"A1:E{len(matrix)}", matrix, value_input_option="RAW")
+        if old_height > len(matrix):
+            audit.batch_clear([f"A{len(matrix) + 1}:E{old_height}"])
+        audit.update("G1:H1", [["Generated rows", len(matrix)]], value_input_option="RAW")
+        style_review_sheet(audit, spreadsheet, [120, 90, 120, 260, 560])
 
     def _migrate_category_labels(self, worksheet) -> int:
         headers = _worksheet_headers(worksheet)
@@ -524,64 +708,84 @@ class SheetClient:
         return sum(before != after for before, after in zip(values, replacements))
 
     def _normalize_month_ledger_values(self, worksheet) -> int:
-        """Make direct Sheet edits obey the same flow/category rules as the app."""
-        headers = _worksheet_headers(worksheet)
-        required = {"amount", "money_flow", "category"}
-        if not required.issubset(headers):
-            return 0
-
-        values = worksheet.get(f"A2:{_column_letter(len(headers))}")
-        if not values:
-            return 0
-
-        amount_index = headers.index("amount")
-        flow_index = headers.index("money_flow")
-        category_index = headers.index("category")
-        normalized_amounts = []
-        normalized_categories = []
-        changes = 0
-        for row in values:
-            padded = row + [""] * (len(headers) - len(row))
-            flow = str(padded[flow_index]).strip().lower()
-            category = str(padded[category_index]).strip()
-            amount = normalize_amount(padded[amount_index])
-            normalized_amount = -abs(amount) if flow == "outflow" else abs(amount) if flow == "inflow" else amount
-            if flow == "inflow" and category not in INFLOW_CATEGORY_OPTIONS:
-                category = "Reimbursement"
-            elif flow == "outflow" and category not in OUTFLOW_CATEGORY_OPTIONS:
-                category = "Others"
-            normalized_amounts.append([normalized_amount])
-            normalized_categories.append([category])
-            current_amount = normalize_amount(padded[amount_index])
-            changes += int(
-                current_amount != normalized_amount
-                or str(padded[category_index]).strip() != category
-            )
-
-        if not changes:
-            return 0
-        amount_column = _column_letter(amount_index + 1)
-        category_column = _column_letter(category_index + 1)
-        end_row = len(values) + 1
-        worksheet.update(
-            f"{amount_column}2:{amount_column}{end_row}",
-            normalized_amounts,
-            value_input_option="USER_ENTERED",
-        )
-        worksheet.update(
-            f"{category_column}2:{category_column}{end_row}",
-            normalized_categories,
-            value_input_option="USER_ENTERED",
-        )
-        return changes
+        """Deprecated: preserve ledger values, blanks, formulas and classifications."""
+        return 0
 
     def _month_worksheets(self, spreadsheet) -> list:
-        worksheets = [
-            worksheet
-            for worksheet in spreadsheet.worksheets()
-            if _month_number_from_title(worksheet.title) is not None
-        ]
-        return sorted(worksheets, key=lambda worksheet: _month_number_from_title(worksheet.title))
+        year = _summary_year_label(getattr(spreadsheet, "title", ""))
+        months = {}
+        for worksheet in spreadsheet.worksheets():
+            month = _month_number_from_title(worksheet.title)
+            if month is None:
+                continue
+            parts = worksheet.title.strip().split()
+            if len(parts) == 2 and year != "Year" and parts[1] != year:
+                continue
+            if month in months:
+                raise ValueError(
+                    f"Duplicate month tabs: {months[month].title!r} and {worksheet.title!r}."
+                )
+            months[month] = worksheet
+        return [months[month] for month in sorted(months)]
+
+    def _ensure_statement_review(self, spreadsheet, month_worksheets, year: str) -> dict[str, int]:
+        from financial_statement import style_review_sheet
+        try:
+            review = spreadsheet.worksheet(STATEMENT_REVIEW_WORKSHEET_TITLE)
+        except gspread.WorksheetNotFound:
+            review = spreadsheet.add_worksheet(
+                title=STATEMENT_REVIEW_WORKSHEET_TITLE, rows=100, cols=5
+            )
+        _ensure_min_columns(review, 5)
+        values = review.get_all_values()
+        header = values[0] if values else []
+        if header[:2] not in ([], ["Month", "Salary Status"]):
+            raise ValueError("Statement Review must have headers Month and Salary Status.")
+        first_migration = len(header) < 5 or not str(header[4]).strip()
+        cutoff = datetime.now().date().replace(day=1)
+        if first_migration:
+            if any(header[3:5]):
+                raise ValueError("Statement Review D1:E1 contains metadata; inspect before migration.")
+            review.update("A1:B1", [["Month", "Salary Status"]], value_input_option="RAW")
+            review.update(
+                "D1:E1", [["Migration cutoff", cutoff.isoformat()]], value_input_option="RAW"
+            )
+        status_rows = {}
+        for row_number, row in enumerate(values[1:], start=2):
+            if row and str(row[0]).strip():
+                title = str(row[0]).strip()
+                if title in status_rows:
+                    raise ValueError(f"Duplicate Statement Review month: {title!r}.")
+                status_rows[title] = row_number
+        next_row = max(2, len(values) + 1)
+        additions = []
+        for month in month_worksheets:
+            if month.title in status_rows:
+                continue
+            parts = month.title.strip().split()
+            month_year = parts[1] if len(parts) == 2 else year
+            historical = (
+                first_migration
+                and month_year.isdigit()
+                and (int(month_year), _month_number_from_title(month.title))
+                < (cutoff.year, cutoff.month)
+            )
+            status_rows[month.title] = next_row + len(additions)
+            additions.append([month.title, "Historical zero" if historical else "Pending"])
+        if additions:
+            _ensure_min_rows(review, next_row + len(additions) - 1)
+            review.update(
+                f"A{next_row}:B{next_row + len(additions) - 1}",
+                additions, value_input_option="RAW",
+            )
+        request = _dropdown_request(
+            worksheet_id=review.id, column_index=1, options=SALARY_STATUS_OPTIONS,
+            message="Pending requires salary review; choose a zero status only after review.",
+        )
+        request["setDataValidation"]["rule"]["strict"] = True
+        spreadsheet.batch_update({"requests": [request]})
+        style_review_sheet(review, spreadsheet, [140, 170, 350, 170, 140])
+        return {month.title: status_rows[month.title] for month in month_worksheets}
 
     def _year_summary_formula(self, spreadsheet) -> str:
         chunks: list[str] = []
@@ -604,120 +808,49 @@ class SheetClient:
 
         return "=VSTACK(" + ",".join(chunks[:-2]) + ")"
 
-    def _write_year_summary(
-        self,
-        worksheet,
-        spreadsheet,
-    ) -> None:
+    def _write_year_summary(self, worksheet, spreadsheet) -> None:
+        from financial_statement import style_statement
+
         month_worksheets = self._month_worksheets(spreadsheet)
         year = _summary_year_label(spreadsheet.title)
         matrix, layout = _summary_matrix_rows(month_worksheets, year)
+        old_values = worksheet.get_all_values()
+        old_height, old_width = _generated_summary_footprint(old_values, matrix, layout)
         matrix_width = len(matrix[0])
         matrix_end_col = _column_letter(matrix_width)
         matrix_end_row = len(matrix)
+        for row_index, row in enumerate(old_values[:matrix_end_row]):
+            for col_index, value in enumerate(row[:matrix_width]):
+                if value != "" and (row_index >= old_height or col_index >= old_width):
+                    raise ValueError(
+                        "Summary contains notes outside its generated table. Move those notes "
+                        "below the new statement before refreshing; nothing was overwritten."
+                    )
         _ensure_min_columns(worksheet, matrix_width)
+        _ensure_min_rows(worksheet, matrix_end_row)
 
-        # Write the replacement before removing old content so a failed refresh never blanks Summary.
+        # Only the generated footprint is owned here; overlapping notes need a migration snapshot.
         worksheet.update(
-            f"A1:{matrix_end_col}{matrix_end_row}",
-            matrix,
+            f"A1:{matrix_end_col}{matrix_end_row}", matrix,
             value_input_option="USER_ENTERED",
         )
         worksheet.update(
-            f"A1:{matrix_end_col}1",
-            [matrix[0]],
-            value_input_option="RAW",
+            f"A1:{matrix_end_col}1", [matrix[0]], value_input_option="RAW",
         )
-        worksheet.batch_clear(
-            [
-                f"A{matrix_end_row + 1}:ZZ1000",
-                f"{_column_letter(matrix_width + 1)}1:ZZ{matrix_end_row}",
-            ]
-        )
-        worksheet.freeze(rows=1, cols=1)
-        worksheet.format(
-            f"A1:{matrix_end_col}1",
-            {
-                "backgroundColor": {"red": 0.12, "green": 0.25, "blue": 0.43},
-                "textFormat": {
-                    "bold": True,
-                    "fontSize": 12,
-                    "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                },
-            },
-        )
-        worksheet.format(
-            f"A2:{matrix_end_col}{matrix_end_row}",
-            {"textFormat": {"bold": False, "fontSize": 12}},
-        )
-        worksheet.format(
-            f"A{layout['first_variable_row']}:{matrix_end_col}{layout['variable_spend_row']}",
-            {
-                "backgroundColor": {"red": 0.93, "green": 0.96, "blue": 0.98},
-                "textFormat": {"bold": False, "fontSize": 12},
-            },
-        )
-        worksheet.format(
-            f"A{layout['first_fixed_row']}:{matrix_end_col}{layout['fixed_spend_row']}",
-            {
-                "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94},
-                "textFormat": {"bold": False, "fontSize": 12},
-            },
-        )
-        worksheet.format(
-            f"A{layout['gross_spend_row']}:{matrix_end_col}{layout['gross_spend_row']}",
-            {
-                "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.82},
-                "textFormat": {"bold": True, "fontSize": 12},
-            },
-        )
-        for summary_row, color in (
-            (layout["variable_spend_row"], {"red": 0.93, "green": 0.96, "blue": 0.98}),
-            (layout["fixed_spend_row"], {"red": 0.94, "green": 0.94, "blue": 0.94}),
-        ):
-            worksheet.format(
-                f"A{summary_row}:{matrix_end_col}{summary_row}",
-                {
-                    "backgroundColor": color,
-                    "textFormat": {"bold": True, "fontSize": 12},
-                },
+        clear_ranges = []
+        if old_height > matrix_end_row:
+            clear_ranges.append(
+                f"A{matrix_end_row + 1}:{_column_letter(old_width)}{old_height}"
             )
-        worksheet.format(
-            f"A{layout['first_offset_row']}:{matrix_end_col}{layout['last_offset_row']}",
-            {
-                "backgroundColor": {"red": 0.88, "green": 0.95, "blue": 0.90},
-                "textFormat": {"bold": False, "fontSize": 12},
-            },
-        )
-        worksheet.format(
-            f"A{layout['total_offset_row']}:{matrix_end_col}{layout['total_offset_row']}",
-            {
-                "backgroundColor": {"red": 0.82, "green": 0.94, "blue": 0.91},
-                "textFormat": {"bold": True, "fontSize": 12},
-            },
-        )
-        for net_spend_row in (layout["net_spend_row"], layout["bottom_net_spend_row"]):
-            worksheet.format(
-                f"A{net_spend_row}:{matrix_end_col}{net_spend_row}",
-                {
-                    "backgroundColor": {"red": 0.10, "green": 0.49, "blue": 0.40},
-                    "textFormat": {
-                        "bold": True,
-                        "fontSize": 12,
-                        "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                    },
-                },
+        if old_width > matrix_width:
+            clear_ranges.append(
+                f"{_column_letter(matrix_width + 1)}1:"
+                f"{_column_letter(old_width)}{min(old_height, matrix_end_row)}"
             )
-        worksheet.format(
-            f"B:{matrix_end_col}",
-            {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}},
-        )
-        _apply_default_column_widths(
-            spreadsheet,
-            worksheet,
-            matrix_width,
-            first_column_width=200,
-        )
+        if clear_ranges:
+            worksheet.batch_clear(clear_ranges)
+        _remove_statement_deficit_rules(worksheet, spreadsheet, layout)
+        style_statement(worksheet, spreadsheet, matrix, layout)
 
     def _append_legacy_with_audit(
         self,
@@ -750,6 +883,7 @@ class SheetClient:
         created_spreadsheet: bool,
         created_worksheet: bool,
     ) -> AppendAudit:
+        _validate_append_transactions(dataframe)
         attempted = len(dataframe)
         existing_transaction_keys = _duplicate_keys_from_worksheet(worksheet)
         to_append = dataframe.copy()
@@ -757,20 +891,24 @@ class SheetClient:
 
         if skip_duplicates:
             incoming_keys = to_append.apply(_transaction_duplicate_key, axis=1)
-            duplicate_in_upload = incoming_keys.duplicated(keep="first") & incoming_keys.ne("")
+            allocation_keys = to_append.apply(_allocation_collision_key, axis=1)
+            duplicate_in_upload = (
+                (incoming_keys.duplicated(keep="first") & incoming_keys.ne(""))
+                | (allocation_keys.duplicated(keep="first") & allocation_keys.ne(""))
+            )
             duplicate_override = to_append.get("duplicate_override", False)
             if not isinstance(duplicate_override, pd.Series):
                 duplicate_override = pd.Series(False, index=to_append.index)
             duplicate_override = duplicate_override.apply(normalize_bool)
             is_new = duplicate_override | (
                 ~incoming_keys.isin(existing_transaction_keys)
+                & ~allocation_keys.isin(existing_transaction_keys)
                 & ~duplicate_in_upload
             )
             skipped = int((~is_new).sum())
             to_append = to_append[is_new].copy()
 
         if not to_append.empty:
-            self._apply_transaction_table_format(worksheet)
             before_next_row = _next_transaction_row(worksheet)
             _append_transaction_rows(worksheet, to_append)
             after_next_row = _next_transaction_row(worksheet)
@@ -880,6 +1018,9 @@ def _duplicate_keys_from_worksheet(worksheet) -> set[str]:
         key = _transaction_duplicate_key(row)
         if key:
             keys.add(key)
+        allocation_key = _allocation_collision_key(row)
+        if allocation_key:
+            keys.add(allocation_key)
     return keys
 
 
@@ -890,9 +1031,27 @@ def _transaction_duplicate_key(row: dict | pd.Series) -> str:
     currency = str(row.get("currency", "SGD") or "SGD").strip().upper()
     flow = str(row.get("money_flow", "")).strip().lower()
     amount = abs(normalize_amount(row.get("amount", 0)))
+    reference = str(row.get("transaction_reference", "")).strip().upper()
     if not date or not description:
         return ""
-    return "|".join([date, source, description, flow, f"{amount:.2f}", currency])
+    key = "|".join([date, source, description, flow, f"{amount:.2f}", currency])
+    return f"{key}|REF:{reference}" if reference else key
+
+
+def _allocation_collision_key(row: dict | pd.Series) -> str:
+    category = str(row.get("category", "")).strip()
+    category = LEGACY_CATEGORY_ALIASES.get(category, category)
+    if (
+        category not in ALLOCATION_CATEGORIES
+        and str(row.get("transaction_type", "")).strip() != "contribution"
+    ):
+        return ""
+    date = str(row.get("date", "")).strip()
+    amount = abs(normalize_amount(row.get("amount", 0)))
+    currency = str(row.get("currency", "SGD") or "SGD").strip().upper()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or amount <= 0:
+        return ""
+    return f"allocation|{date[:7]}|{amount:.2f}|{currency}"
 
 
 def _summary_row_end(worksheet) -> int:
@@ -931,246 +1090,106 @@ def _offset_categories_formula() -> str:
 
 
 def _monthly_net_spend_formula(worksheet, *, headers: list[str] | None = None) -> str:
-    headers = headers or _worksheet_headers(worksheet)
-    required = ["check", "amount", "category", "money_flow"]
-    if not all(column in headers for column in required):
-        return "=0"
-
-    title = _quote_sheet_title(worksheet.title)
-    check_col = _column_letter(headers.index("check") + 1)
-    amount_col = _column_letter(headers.index("amount") + 1)
-    category_col = _column_letter(headers.index("category") + 1)
-    flow_col = _column_letter(headers.index("money_flow") + 1)
-    row_end = _summary_row_end(worksheet)
-    amount_range = f"{title}!${amount_col}$2:${amount_col}${row_end}"
-    check_range = f"{title}!${check_col}$2:${check_col}${row_end}"
-    flow_range = f"{title}!${flow_col}$2:${flow_col}${row_end}"
-    category_range = f"{title}!${category_col}$2:${category_col}${row_end}"
-    gross_spend = (
-        f"IFERROR(SUMPRODUCT(ABS({amount_range}),--({check_range}=\"Yes\"),"
-        f"--({flow_range}=\"outflow\"),--({category_range}<>\"Transfer\")),0)"
-    )
+    headers = headers if headers is not None else _worksheet_headers(worksheet)
+    gross = _monthly_gross_spend_formula(worksheet, headers=headers).removeprefix("=")
     offsets = "+".join(
-        f"IFERROR(SUMPRODUCT(ABS({amount_range}),--({check_range}=\"Yes\"),"
-        f"--({flow_range}=\"inflow\"),--({category_range}=\"{category}\")),0)"
-        for category in sorted(EXPENSE_OFFSET_INFLOW_CATEGORIES)
+        _monthly_category_formula(worksheet, category, headers=headers).removeprefix("=")
+        for category in OFFSET_CATEGORIES
     )
-    return f"={gross_spend}-({offsets})"
+    return f"={gross}-({offsets})"
 
 
 def _monthly_category_formula(
-    worksheet,
-    category: str,
-    *,
-    headers: list[str] | None = None,
+    worksheet, category: str, *, headers: list[str] | None = None, year=None,
 ) -> str:
-    headers = headers or _worksheet_headers(worksheet)
-    required = ["check", "amount", "category", "money_flow"]
-    if not all(column in headers for column in required):
-        return "=0"
+    from financial_statement import statement_category_formula
 
-    title = _quote_sheet_title(worksheet.title)
-    check_col = _column_letter(headers.index("check") + 1)
-    amount_col = _column_letter(headers.index("amount") + 1)
-    category_col = _column_letter(headers.index("category") + 1)
-    flow_col = _column_letter(headers.index("money_flow") + 1)
-    row_end = _summary_row_end(worksheet)
-    flow = "inflow" if category in INFLOW_CATEGORY_OPTIONS else "outflow"
-    sign = "-" if category in EXPENSE_OFFSET_INFLOW_CATEGORIES else ""
-    category_value = category.replace('"', '""')
-    amount_range = f"{title}!${amount_col}$2:${amount_col}${row_end}"
-    check_range = f"{title}!${check_col}$2:${check_col}${row_end}"
-    flow_range = f"{title}!${flow_col}$2:${flow_col}${row_end}"
-    category_range = f"{title}!${category_col}$2:${category_col}${row_end}"
-    return (
-        f"={sign}IFERROR(SUMPRODUCT(ABS({amount_range}),--({check_range}=\"Yes\"),"
-        f"--({flow_range}=\"{flow}\"),--({category_range}=\"{category_value}\")),0)"
-    )
+    return statement_category_formula(worksheet, category, headers=headers, year=year)
 
 
 def _monthly_gross_spend_formula(worksheet, *, headers: list[str] | None = None) -> str:
-    headers = headers or _worksheet_headers(worksheet)
-    required = ["check", "amount", "category", "money_flow"]
-    if not all(column in headers for column in required):
-        return "=0"
+    headers = headers if headers is not None else _worksheet_headers(worksheet)
+    terms = [
+        _monthly_category_formula(worksheet, category, headers=headers).removeprefix("=")
+        for category in VARIABLE_EXPENSE_CATEGORIES + FIXED_EXPENSE_CATEGORIES
+    ]
+    return "=" + "+".join(terms)
 
-    title = _quote_sheet_title(worksheet.title)
-    check_col = _column_letter(headers.index("check") + 1)
-    amount_col = _column_letter(headers.index("amount") + 1)
-    category_col = _column_letter(headers.index("category") + 1)
-    flow_col = _column_letter(headers.index("money_flow") + 1)
-    row_end = _summary_row_end(worksheet)
-    amount_range = f"{title}!${amount_col}$2:${amount_col}${row_end}"
-    check_range = f"{title}!${check_col}$2:${check_col}${row_end}"
-    flow_range = f"{title}!${flow_col}$2:${flow_col}${row_end}"
-    category_range = f"{title}!${category_col}$2:${category_col}${row_end}"
-    return (
-        f"=IFERROR(SUMPRODUCT(ABS({amount_range}),--({check_range}=\"Yes\"),"
-        f"--({flow_range}=\"outflow\"),--({category_range}<>\"Transfer\")),0)"
+
+def _summary_matrix_rows(
+    month_worksheets: list, year: str, *, salary_status_rows: dict[str, int] | None = None,
+) -> tuple[list[list[str]], dict[str, int | list[int]]]:
+    from financial_statement import statement_matrix
+
+    return statement_matrix(month_worksheets, year, salary_status_rows=salary_status_rows)
+
+
+def _generated_summary_footprint(values, matrix, layout) -> tuple[int, int]:
+    if not values or not values[0] or "Year Total" not in values[0]:
+        return 0, 0
+    width = values[0].index("Year Total") + 1
+    if values[0][0] == matrix[0][0] and len(values) > 1 and values[1][:1] == ["INCOME"]:
+        final_label = matrix[layout["final"] - 1][0]
+        for row_number, row in enumerate(values[:len(matrix)], start=1):
+            if row and row[0] == final_label:
+                return row_number, width
+        return 0, 0
+    if values[0][0] == "Category":
+        # Legacy generated matrices ended at row 27; notes below are not ours.
+        for row_number, row in enumerate(values[2:27], start=3):
+            if row and row[0] == "Net Spend (a + b + c)":
+                return row_number, width
+        return min(27, len(values)), width
+    if values[0][0] == matrix[0][0]:
+        final_label = matrix[layout["final"] - 1][0]
+        for row_number, row in enumerate(values[:len(matrix)], start=1):
+            if row and row[0] == final_label:
+                return row_number, width
+    return 0, 0
+
+
+def _remove_statement_deficit_rules(worksheet, spreadsheet, layout) -> None:
+    metadata = spreadsheet.fetch_sheet_metadata(
+        params={"fields": "sheets(properties(sheetId),conditionalFormats)"}
     )
-
-
-def _summary_matrix_rows(month_worksheets: list, year: str) -> tuple[list[list[str]], dict[str, int]]:
-    fixed_categories = ["Insurance", "Subscriptions", "Income Tax"]
-    spending_categories = [
-        category
-        for category in CATEGORY_OPTIONS
-        if category not in INFLOW_CATEGORY_OPTIONS and category != "Transfer"
-    ]
-    variable_categories = [
-        category for category in spending_categories if category not in fixed_categories
-    ]
-    offset_categories = [
-        "Carousell Sales",
-        "Cashbacks & Refunds",
-        "Reimbursement",
-        "GVs & Prize Award",
-    ]
-    month_headers = [_summary_month_label(worksheet, year) for worksheet in month_worksheets]
-    matrix = [["Category", *month_headers, "Year Total"]]
-    matrix.append(["Net Spend (a + b + c)", *([""] * len(month_worksheets)), ""])
-
-    headers_by_worksheet = {
-        worksheet.title: _worksheet_headers(worksheet) for worksheet in month_worksheets
+    expected = {
+        "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+        "format": {
+            "backgroundColor": {"red": 1, "green": .9, "blue": .9},
+            "textFormat": {
+                "foregroundColor": {"red": .7, "green": .08, "blue": .08}, "bold": True,
+            },
+        },
     }
-    for category in variable_categories:
-        matrix.append(
-            [category]
-            + [
-                _monthly_category_formula(
-                    worksheet,
-                    category,
-                    headers=headers_by_worksheet[worksheet.title],
+    requests = []
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") != worksheet.id:
+            continue
+        for index, rule in enumerate(sheet.get("conditionalFormats", [])):
+            ranges = rule.get("ranges", [])
+            rows = {layout["operating"], layout["final"]}
+            actual = rule.get("booleanRule", {})
+            actual_format = actual.get("format", {})
+            expected_format = expected["format"]
+            # Sheets quantizes RGB to 8-bit and adds ColorStyle mirrors on readback.
+            colors_match = all(
+                abs(actual_color.get(channel, 0) - expected_color.get(channel, 0)) <= 1 / 255 + 1e-6
+                for actual_color, expected_color in (
+                    (actual_format.get("backgroundColor", {}), expected_format["backgroundColor"]),
+                    (actual_format.get("textFormat", {}).get("foregroundColor", {}), expected_format["textFormat"]["foregroundColor"]),
                 )
-                for worksheet in month_worksheets
-            ]
-            + [""]
-        )
-    matrix.append(["Variable Spend (a)", *([""] * len(month_worksheets)), ""])
-    for category in fixed_categories:
-        matrix.append(
-            [category]
-            + [
-                _monthly_category_formula(
-                    worksheet,
-                    category,
-                    headers=headers_by_worksheet[worksheet.title],
-                )
-                for worksheet in month_worksheets
-            ]
-            + [""]
-        )
-    matrix.append(["Fixed Spend (b)", *([""] * len(month_worksheets)), ""])
-    matrix.append(["Gross Spend (a + b)", *([""] * len(month_worksheets)), ""])
-    for category in offset_categories:
-        matrix.append(
-            [category]
-            + [
-                _monthly_category_formula(
-                    worksheet,
-                    category,
-                    headers=headers_by_worksheet[worksheet.title],
-                )
-                for worksheet in month_worksheets
-            ]
-            + [""]
-        )
-    matrix.append(["Total Offset (c)", *([""] * len(month_worksheets)), ""])
-    matrix.append(["Net Spend (a + b + c)", *([""] * len(month_worksheets)), ""])
-
-    net_spend_row = 2
-    first_variable_row = 3
-    last_variable_row = first_variable_row + len(variable_categories) - 1
-    variable_spend_row = last_variable_row + 1
-    first_fixed_row = variable_spend_row + 1
-    last_fixed_row = first_fixed_row + len(fixed_categories) - 1
-    fixed_spend_row = last_fixed_row + 1
-    gross_spend_row = fixed_spend_row + 1
-    first_offset_row = gross_spend_row + 1
-    last_offset_row = first_offset_row + len(offset_categories) - 1
-    total_offset_row = last_offset_row + 1
-    bottom_net_spend_row = total_offset_row + 1
-    first_month_col = 2
-    last_month_col = first_month_col + len(month_worksheets) - 1
-    year_total_col = first_month_col + len(month_worksheets)
-
-    for row_index in (
-        list(range(first_variable_row, last_variable_row + 1))
-        + list(range(first_fixed_row, last_fixed_row + 1))
-        + list(range(first_offset_row, last_offset_row + 1))
-    ):
-        matrix[row_index - 1][-1] = _summary_row_total_formula(
-            row_index,
-            first_month_col,
-            last_month_col,
-        )
-    for row_index in (variable_spend_row, fixed_spend_row):
-        matrix[row_index - 1][-1] = _summary_row_total_formula(
-            row_index,
-            first_month_col,
-            last_month_col,
-        )
-
-    for month_index in range(len(month_worksheets)):
-        worksheet = month_worksheets[month_index]
-        headers = headers_by_worksheet[worksheet.title]
-        matrix[net_spend_row - 1][month_index + 1] = _monthly_net_spend_formula(
-            worksheet,
-            headers=headers,
-        )
-        column = _column_letter(first_month_col + month_index)
-        matrix[variable_spend_row - 1][month_index + 1] = (
-            f"=SUM({column}{first_variable_row}:{column}{last_variable_row})"
-        )
-        matrix[fixed_spend_row - 1][month_index + 1] = (
-            f"=SUM({column}{first_fixed_row}:{column}{last_fixed_row})"
-        )
-        matrix[gross_spend_row - 1][month_index + 1] = (
-            f"={column}{variable_spend_row}+{column}{fixed_spend_row}"
-        )
-        matrix[total_offset_row - 1][month_index + 1] = (
-            f"=SUM({column}{first_offset_row}:{column}{last_offset_row})"
-        )
-        matrix[bottom_net_spend_row - 1][month_index + 1] = (
-            f"={column}{gross_spend_row}+{column}{total_offset_row}"
-        )
-
-    matrix[gross_spend_row - 1][-1] = _summary_row_total_formula(
-        gross_spend_row,
-        first_month_col,
-        last_month_col,
-    )
-    matrix[net_spend_row - 1][-1] = _summary_row_total_formula(
-        net_spend_row,
-        first_month_col,
-        last_month_col,
-    )
-    matrix[total_offset_row - 1][-1] = _summary_row_total_formula(
-        total_offset_row,
-        first_month_col,
-        last_month_col,
-    )
-    matrix[bottom_net_spend_row - 1][-1] = _summary_row_total_formula(
-        bottom_net_spend_row,
-        first_month_col,
-        last_month_col,
-    )
-    return matrix, {
-        "first_variable_row": first_variable_row,
-        "last_variable_row": last_variable_row,
-        "variable_spend_row": variable_spend_row,
-        "first_fixed_row": first_fixed_row,
-        "last_fixed_row": last_fixed_row,
-        "fixed_spend_row": fixed_spend_row,
-        "gross_spend_row": gross_spend_row,
-        "first_offset_row": first_offset_row,
-        "last_offset_row": last_offset_row,
-        "total_offset_row": total_offset_row,
-        "net_spend_row": net_spend_row,
-        "bottom_net_spend_row": bottom_net_spend_row,
-        "year_total_col": year_total_col,
-    }
-
+                for channel in ("red", "green", "blue")
+            )
+            if (actual.get("condition") == expected["condition"] and colors_match
+                    and actual_format.get("textFormat", {}).get("bold") is True and len(ranges) == 2
+                    and {area.get("endRowIndex") for area in ranges} == rows
+                    and all(area.get("sheetId") == worksheet.id
+                            and area.get("startRowIndex") == area.get("endRowIndex") - 1
+                            and area.get("startColumnIndex") == 1
+                            and area.get("endColumnIndex", 0) >= 2 for area in ranges)):
+                requests.append({"deleteConditionalFormatRule": {"sheetId": worksheet.id, "index": index}})
+    if requests:
+        spreadsheet.batch_update({"requests": list(reversed(requests))})
 
 def _summary_row_total_formula(row: int, first_month_col: int, last_month_col: int) -> str:
     if last_month_col < first_month_col:
@@ -1376,6 +1395,11 @@ def _format_year_summary(worksheet, *, start_row: int = 1) -> None:
     worksheet.batch_format(formats)
 
 
+def _ensure_min_rows(worksheet, required_rows: int) -> None:
+    if worksheet.row_count < required_rows:
+        worksheet.add_rows(required_rows - worksheet.row_count)
+
+
 def _ensure_min_columns(worksheet, required_columns: int) -> None:
     if worksheet.col_count < required_columns:
         worksheet.add_cols(required_columns - worksheet.col_count)
@@ -1494,11 +1518,12 @@ def _dependent_category_dropdown_request(
 ) -> dict:
     flow_column = _column_letter(flow_column_index + 1)
     title = validation_worksheet_title.replace("'", "''")
+    validation_end = len(CATEGORY_OPTIONS) + len(LEGACY_CATEGORY_ALIASES) + 1
     range_formula = (
         f"=INDIRECT(\"'{title}'!\"&IF(${flow_column}2=\"inflow\","
-        f"\"$B$2:$B${len(INFLOW_CATEGORY_OPTIONS) + 1}\","
+        f"\"$B$2:$B${validation_end}\","
         f"IF(${flow_column}2=\"outflow\","
-        f"\"$A$2:$A${len(OUTFLOW_CATEGORY_OPTIONS) + 1}\",\"$C$2\")))"
+        f"\"$A$2:$A${validation_end}\",\"$C$2\")))"
     )
     return {
         "setDataValidation": {
@@ -1530,10 +1555,10 @@ def _amount_sign_validation_request(
     amount_column = _column_letter(amount_column_index + 1)
     flow_column = _column_letter(flow_column_index + 1)
     formula = (
-        f'=OR(${amount_column}2="",${flow_column}2="",'
+        f'=OR(${amount_column}2="",AND(ISNUMBER(${amount_column}2),OR('
         f'AND(${flow_column}2="inflow",${amount_column}2>0),'
         f'AND(${flow_column}2="outflow",${amount_column}2<0),'
-        f'AND(${flow_column}2="neutral",${amount_column}2=0))'
+        f'${flow_column}2="neutral")))'
     )
     return {
         "setDataValidation": {
@@ -1548,7 +1573,7 @@ def _amount_sign_validation_request(
                     "type": "CUSTOM_FORMULA",
                     "values": [{"userEnteredValue": formula}],
                 },
-                "inputMessage": "Inflow amounts must be positive; outflow amounts must be negative.",
+                "inputMessage": "Numeric amounts: inflow positive, outflow negative; neutral transfers are excluded.",
                 "strict": True,
                 "showCustomUi": True,
             },
@@ -1589,8 +1614,8 @@ def _flow_sensitive_category_request(
                     "values": [{"userEnteredValue": formula}],
                 },
                 "inputMessage": (
-                    "Inflow: Carousell Sales, Cashbacks, or Reimbursement. "
-                    "Outflow: an expense category. Neutral: Transfer."
+                    "Inflow: income or expense offsets. Outflow: spending or confirmed "
+                    "contributions. Neutral: Transfer."
                 ),
                 "strict": True,
                 "showCustomUi": True,
@@ -1607,6 +1632,10 @@ def _worksheet_headers(worksheet) -> list[str]:
 
 
 def _transaction_records_from_worksheet(worksheet) -> list[dict[str, str]]:
+    return [record for _, record in _transaction_records_with_rows(worksheet)]
+
+
+def _transaction_records_with_rows(worksheet) -> list[tuple[int, dict[str, str]]]:
     headers = _worksheet_headers(worksheet)
     if not headers:
         return []
@@ -1618,11 +1647,11 @@ def _transaction_records_from_worksheet(worksheet) -> list[dict[str, str]]:
         return []
 
     records = []
-    for row in values[1:]:
+    for row_number, row in enumerate(values[1:], start=2):
         padded = row + [""] * (len(headers) - len(row))
         if not str(padded[date_index]).strip():
             continue
-        records.append(dict(zip(headers, padded[: len(headers)])))
+        records.append((row_number, dict(zip(headers, padded[: len(headers)]))))
     return records
 
 
@@ -1644,6 +1673,35 @@ def _category_records_from_worksheet(worksheet) -> list[dict[str, str]]:
             }
         )
     return records
+
+
+def _validate_append_transactions(dataframe: pd.DataFrame) -> None:
+    for index, row in dataframe.iterrows():
+        raw_amount = row.get("amount", "")
+        missing = pd.isna(raw_amount) or str(raw_amount).strip() == ""
+        amount, parse_error = normalize_amount_with_error(raw_amount)
+        if (missing or parse_error or not math.isfinite(amount) or normalize_bool(row.get("amount_missing", False))
+                or normalize_bool(row.get("amount_parse_error", False))):
+            raise ValueError(f"Row {index}: a valid, explicit amount is required.")
+        category = str(row.get("category", "")).strip()
+        category = LEGACY_CATEGORY_ALIASES.get(category, category)
+        if str(row.get("currency", "")).strip().upper() != "SGD":
+            raise ValueError(f"Row {index}: a verified SGD amount is required; no exchange rate is assumed.")
+        flow = str(row.get("money_flow", "")).strip().lower()
+        kind = str(row.get("transaction_type", "")).strip().lower()
+        if flow == "neutral" and category == "Transfer":
+            continue
+        spending = VARIABLE_EXPENSE_CATEGORIES + FIXED_EXPENSE_CATEGORIES
+        if category in INCOME_CATEGORIES + OFFSET_CATEGORIES:
+            valid = flow == "inflow" and amount > 0
+        elif category in spending + ALLOCATION_CATEGORIES:
+            valid = flow == "outflow" and amount < 0
+        else:
+            valid = False
+        if not valid:
+            raise ValueError(f"Row {index}: unsupported category/flow or amount sign.")
+        if category in ALLOCATION_CATEGORIES and kind != "contribution":
+            raise ValueError(f"Row {index}: allocations require transaction_type='contribution'.")
 
 
 def _rows_for_worksheet(worksheet, dataframe: pd.DataFrame) -> list[list[str]]:
@@ -1673,6 +1731,7 @@ def _sheet_cell_value(value):
 
 
 def _append_transaction_rows(worksheet, dataframe: pd.DataFrame) -> None:
+    _validate_append_transactions(dataframe)
     rows = _rows_for_worksheet(worksheet, dataframe)
     if not rows:
         return

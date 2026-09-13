@@ -8,7 +8,15 @@ from typing import Iterable
 import pandas as pd
 
 
-CATEGORY_OPTIONS = [
+INCOME_CATEGORIES = [
+    "Net Salary",
+    "Bonus / AVC / Other Employment Income",
+    "Carousell Sales",
+    "Prize Awards/Government Vouchers",
+    "Gifts received",
+]
+
+VARIABLE_EXPENSE_CATEGORIES = [
     "Food",
     "Public Transport",
     "Taxi",
@@ -19,60 +27,56 @@ CATEGORY_OPTIONS = [
     "Health",
     "Personal Care",
     "Education",
-    "Bills",
     "Admin & Fees",
     "Others",
+]
+
+FIXED_EXPENSE_CATEGORIES = [
+    "Parent Allowance",
     "Insurance",
     "Subscriptions",
     "Income Tax",
-    "Transfer",
-    "Carousell Sales",
-    "Cashbacks & Refunds",
-    "Reimbursement",
-    "GVs & Prize Award",
+    "Bills / Recurring Commitments",
 ]
+
+ALLOCATION_CATEGORIES = [
+    "ETF Contributions",
+    "Equity Contributions",
+    "Crypto Contributions",
+    "Commodities Contributions",
+    "Dedicated Cash Savings",
+    "Other Investment Contributions",
+]
+
+OFFSET_CATEGORIES = ["Reimbursements", "Cashbacks & Refunds"]
+# Retain ambiguous legacy classifications without guessing their economic meaning.
+REVIEW_CATEGORIES = ["GVs & Prize Award", "Income", "Funding", "Investments", "Family"]
+INFLOW_CATEGORY_OPTIONS = INCOME_CATEGORIES + OFFSET_CATEGORIES + REVIEW_CATEGORIES[:3]
+OUTFLOW_CATEGORY_OPTIONS = VARIABLE_EXPENSE_CATEGORIES + FIXED_EXPENSE_CATEGORIES + ALLOCATION_CATEGORIES
+CATEGORY_OPTIONS = INCOME_CATEGORIES + VARIABLE_EXPENSE_CATEGORIES + FIXED_EXPENSE_CATEGORIES + OFFSET_CATEGORIES + ALLOCATION_CATEGORIES + ["Transfer"] + REVIEW_CATEGORIES
 
 CATEGORY_MIGRATIONS = {
     "Groceries": "Others",
     "Gifts & Charity": "Gifts",
     "Auto & Parking": "Others",
     "Business": "Others",
-    "Family": "Others",
     "Fuel": "Others",
     "Kids": "Others",
     "Loans": "Others",
     "Pets": "Others",
     "Cash Withdrawal": "Others",
     "Rental": "Others",
-    "Investments": "Others",
     "Cash & Cheque": "Others",
     "Taxes": "Income Tax",
     "Refund": "Cashbacks & Refunds",
     "Cashbacks": "Cashbacks & Refunds",
     "Fees": "Admin & Fees",
-    "Funding": "Reimbursement",
-    "Income": "Reimbursement",
+    "Reimbursement": "Reimbursements",
+    "Bills": "Bills / Recurring Commitments",
+    "Prize Awards / Other Cash Income": "Prize Awards/Government Vouchers",
+    "Equity / ETF Contributions": "ETF Contributions",
+    "Money Market Fund Contributions": "Other Investment Contributions",
 }
-
-INFLOW_CATEGORY_OPTIONS = [
-    "Reimbursement",
-    "Carousell Sales",
-    "Cashbacks & Refunds",
-    "GVs & Prize Award",
-]
-
-OUTFLOW_CATEGORY_OPTIONS = [
-    category
-    for category in CATEGORY_OPTIONS
-    if category
-    not in {
-        "Reimbursement",
-        "Carousell Sales",
-        "Cashbacks & Refunds",
-        "GVs & Prize Award",
-        "Transfer",
-    }
-]
 
 
 SHEET_COLUMNS = [
@@ -82,6 +86,8 @@ SHEET_COLUMNS = [
     "description",
     "amount_original",
     "amount_parse_error",
+    "amount_missing",
+    "allocation_confirmed",
     "amount",
     "currency",
     "transaction_reference",
@@ -109,6 +115,16 @@ SHEET_COLUMNS = [
     "confidence",
     "image_filename",
     "archive_path",
+    "screenshot_id",
+    "image_region",
+    "extraction_confidence",
+    "matched_workbook_id",
+    "matched_worksheet",
+    "matched_worksheet_id",
+    "matched_row",
+    "matched_sheet_data",
+    "decision_source",
+    "workflow_state",
     "transaction_hash",
     "raw_text",
 ]
@@ -131,13 +147,8 @@ GOOGLE_SHEET_COLUMNS = [
     "transaction_type",
 ]
 
-# These inflow categories reduce the user's net spending in summaries.
-EXPENSE_OFFSET_INFLOW_CATEGORIES = {
-    "Reimbursement",
-    "Carousell Sales",
-    "Cashbacks & Refunds",
-    "GVs & Prize Award",
-}
+# Income is not an expense offset. Reporting uses positive offsets and subtracts D.
+EXPENSE_OFFSET_INFLOW_CATEGORIES = set(OFFSET_CATEGORIES)
 
 
 def parse_iso_date(value: str) -> str:
@@ -165,7 +176,8 @@ def normalize_amount_with_error(value: object) -> tuple[float, bool]:
         return 0.0, False
     text = str(value).strip().replace("$", "").replace(",", "")
     try:
-        return float(Decimal(text)), False
+        number = Decimal(text)
+        return (float(number), False) if number.is_finite() else (0.0, True)
     except (InvalidOperation, ValueError):
         return 0.0, bool(str(value).strip())
 
@@ -202,11 +214,13 @@ def rows_to_dataframe(rows: Iterable[dict]) -> pd.DataFrame:
         item = {column: row.get(column, "") for column in SHEET_COLUMNS}
         item["check"] = str(item["check"] or "No").strip() or "No"
         item["date"] = parse_iso_date(item["date"])
+        item["amount_missing"] = normalize_bool(item["amount_missing"]) or item["amount"] is None or str(item["amount"]).strip() == ""
+        item["allocation_confirmed"] = normalize_bool(item["allocation_confirmed"])
         item["amount_original"] = str(
             item["amount_original"] if item["amount_original"] != "" else item["amount"]
         )
         item["amount"], amount_parse_error = normalize_amount_with_error(item["amount"])
-        item["amount_parse_error"] = amount_parse_error
+        item["amount_parse_error"] = amount_parse_error or normalize_bool(item["amount_parse_error"])
         item["currency"] = str(item["currency"] or "SGD").upper()
         item["category"] = normalize_category(item["category"])
         item["reimbursement_candidate"] = normalize_bool(item["reimbursement_candidate"])

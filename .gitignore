@@ -4,5 +4,7 @@ __pycache__/
 *.py[cod]
 service_account*.json
 review_memory.json
+backups/
+.statement-test/
 screenshots/*
 !screenshots/.gitkeep

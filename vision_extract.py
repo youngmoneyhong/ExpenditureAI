@@ -8,7 +8,7 @@ from pathlib import Path
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from validators import build_transaction_hash, parse_iso_date
+from validators import CATEGORY_OPTIONS, build_transaction_hash, parse_iso_date
 
 
 class Source(str, Enum):
@@ -46,13 +46,13 @@ class ExtractedTransaction(BaseModel):
     date: str = Field(description="Transaction date in ISO format YYYY-MM-DD when possible.")
     source: Source = Field(description="Detected source app or account.")
     description: str = Field(description="Merchant, recipient, sender, or transaction description.")
-    amount: float = Field(description="Negative for spend/outflow, positive for income/refund/inflow.")
+    amount: float | None = Field(description="Negative for outflow, positive for inflow. Null when missing or unreadable; zero only when visibly zero.")
     currency: str = Field(description="Currency code, usually SGD.")
     transaction_time: str = Field(description="Visible transaction time. Use an empty string if unavailable.")
     transaction_reference: str = Field(description="Visible transaction ID/reference. Use an empty string if unavailable.")
     money_flow: MoneyFlow = Field(description="Direction of money movement from the user's perspective.")
     transaction_type: TransactionType = Field(description="Best classification of the transaction direction/type.")
-    category: str = Field(description="Optional spending category inferred from description. Use an empty string if unknown.")
+    category: str = Field(description="Category from: " + ", ".join(CATEGORY_OPTIONS) + ". Use an empty string if unknown.")
     reimbursement_candidate: bool = Field(
         description=(
             "True if this appears to be a friend paying the user back for a shared/group bill, "
@@ -75,6 +75,10 @@ class ExtractedTransaction(BaseModel):
     )
     confidence: float = Field(ge=0, le=1, description="Extraction confidence from 0 to 1.")
     raw_text: str = Field(description="Relevant OCR text used for this transaction. Use an empty string if unavailable.")
+    image_region: dict[str, float] | None = Field(
+        default=None,
+        description="Optional normalized x, y, width and height coordinates for the visible transaction row.",
+    )
 
 
 class TransactionExtraction(BaseModel):
@@ -99,6 +103,14 @@ Rules:
 - Do not return DBS PayLah "Top up my wallet" rows. They are internal wallet funding transfers, even when shown as a positive green amount. Still return a separate recipient payment below or above it (for example, "amanda") as a negative outflow.
 - Ignore UOB_TMRW transaction rows whose description starts with PAYMT THRU E-BANK.
 - Treat outbound UOB credit-card bill settlements, including UOB BANK Transfer CCRD rows, as neutral transfers rather than expenses.
+- Net Salary is only salary actually credited after employee CPF. Do not use gross salary, employer CPF, or imputed amounts.
+- Bonus / AVC / Other Employment Income is cash employment income credited; Prize Awards/Government Vouchers covers cash prizes and government vouchers.
+- Ignore noncash vouchers, gift cards, reward points, and noncash prizes as income.
+- Own-account transfers are neutral Transfer rows, not income. Investment sale proceeds and withdrawals are neutral Funding rows, never income or expense offsets.
+- Suggest an allocation category only for possible new external capital into investments or dedicated savings. Do not mark transaction_type as contribution: only the user can confirm this later.
+- Bank and brokerage legs must not count twice. Reinvesting proceeds or moving existing investments is not a new contribution.
+- Unknown inflows require review; never assume Reimbursements. Legacy GVs & Prize Award, Income, and Funding must not be guessed into cash income.
+- Use null for missing or unreadable amounts, never fabricate zero. Preserve a visibly zero amount as zero.
 - If source is unclear, use UNKNOWN and add a warning.
 - Flag reimbursement_candidate=true only when the row is an incoming inflow from an individual and the description/reference suggests repayment, splitting, shared expense, food, ride, booking, tickets, hotel, cab, Grab, dinner, lunch, drinks, or settlement.
 - Do not flag all incoming PayLah transfers as reimbursements. If it is only a name with no reference, set reimbursement_candidate=false unless there is strong context.
@@ -106,7 +118,9 @@ Rules:
 - Preserve merchant or recipient names in the description.
 - Ignore available balance, credit limit, reward points, navigation labels, and totals unless they are clearly a transaction row.
 - If unsure about a row, include it with a lower confidence and add a warning.
+- When practical, return image_region as normalized x, y, width and height coordinates for the transaction row; otherwise use null.
 """
+SYSTEM_PROMPT += "\nAllowed categories: " + ", ".join(CATEGORY_OPTIONS) + ".\n"
 
 
 def _image_to_data_url(path: Path) -> str:
@@ -175,6 +189,8 @@ def extraction_to_rows(
             "description": transaction.description,
             "amount_original": transaction.amount,
             "amount_parse_error": False,
+            "amount_missing": transaction.amount is None,
+            "allocation_confirmed": False,
             "amount": transaction.amount,
             "currency": transaction.currency or "SGD",
             "transaction_time": transaction.transaction_time,
@@ -190,6 +206,7 @@ def extraction_to_rows(
             "confidence": transaction.confidence,
             "image_filename": filename,
             "archive_path": archive_path,
+            "image_region": transaction.image_region,
             "raw_text": transaction.raw_text,
         }
         row["transaction_hash"] = build_transaction_hash(

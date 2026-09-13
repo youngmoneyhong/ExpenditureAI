@@ -31,7 +31,7 @@ flowchart LR
 | **1. Capture** | Reads one or many bank screenshots with structured AI extraction. | Eliminates manual transaction entry. |
 | **2. Control** | Detects overlaps, known transactions, incorrect signs, and category conflicts before append. | Keeps the ledger trustworthy. |
 | **3. Organize** | Routes each record into the right year workbook and month tab automatically. | Keeps every year self-contained. |
-| **4. Understand** | Maintains a monthly category matrix, subtotals, offsets, and year totals. | Makes spending patterns immediately legible. |
+| **4. Understand** | Separates income, expenditure, offsets, and investment/savings allocations. | Shows both operating surplus and cash left after allocations. |
 
 ## MVP Capabilities
 
@@ -107,11 +107,15 @@ Transactions never get compiled into the wrong year. Uploading a 2027 transactio
 
 ## Categories And Money Flow
 
-| Outflows | Inflows / offsets |
+| Statement section | Categories |
 | --- | --- |
-| `Food`, `Public Transport`, `Taxi`, `Shopping`, `Gifts`, `Entertainment`, `Travel`, `Health`, `Personal Care`, `Education`, `Bills`, `Admin & Fees`, `Others`, `Insurance`, `Subscriptions`, `Income Tax` | `Carousell Sales`, `Cashbacks & Refunds`, `Reimbursement`, `GVs & Prize Award` |
+| **Income (A)** | `Net Salary`, `Bonus / AVC / Other Employment Income`, `Carousell Sales`, `Prize Awards/Government Vouchers`, `Gifts received` |
+| **Variable expenditure (B)** | `Food`, `Public Transport`, `Taxi`, `Shopping`, `Gifts`, `Entertainment`, `Travel`, `Health`, `Personal Care`, `Education`, `Admin & Fees`, `Others` |
+| **Fixed expenditure (C)** | `Parent Allowance`, `Insurance`, `Subscriptions`, `Income Tax`, `Bills / Recurring Commitments` |
+| **Expense offsets (D)** | `Reimbursements`, `Cashbacks & Refunds` |
+| **Investment & savings allocation (E)** | `ETF Contributions`, `Equity Contributions`, `Crypto Contributions`, `Commodities Contributions`, `Dedicated Cash Savings`, `Other Investment Contributions` |
 
-Outflows must be negative and inflows must be positive. Inflow categories are shown in the Summary as offsets: they reduce `Net Spend` and roll into `Total Offset (c)`. `Transfer` is reserved for neutral internal transfers, including ignored PayLah top-ups.
+The ledger uses negative outflows and positive inflows. The cash statement displays positive magnitudes and subtracts offsets and allocations explicitly. Carousell sales are income, not expense offsets. `Transfer` covers neutral own-account movements, including ignored PayLah top-ups and card settlements. Government vouchers recorded in `Prize Awards/Government Vouchers` are treated as income; other noncash vouchers and funding movements are not.
 
 ## Google Sheets Experience
 
@@ -125,29 +129,55 @@ Each month tab keeps the user-facing ledger in columns A-L. The header is frozen
 
 ### Annual Summary
 
-The Summary is one readable matrix: categories as rows, calendar-ordered `Month Year` columns, and a `Year Total` column. Only monthly rows with `check = Yes` are included.
+The Summary is one cash-based statement: categories as rows, calendar-ordered `Month Year` columns, and a `Year Total` column. It includes checked (`Yes`) SGD transactions paid in the tab's month and workbook year, not forecasts, portfolio valuations, or accrued income.
 
 ```text
-Net Spend (a + b + c)          highlighted closing figure
-  Variable categories
-Variable Spend (a)             variable-spend subtotal
-  Insurance / Subscriptions / Income Tax
-Fixed Spend (b)                fixed-spend subtotal
-Gross Spend (a + b)            spend before offsets
-  Carousell Sales / Cashbacks & Refunds / Reimbursement / GVs & Prize Award
-Total Offset (c)               inflow total
-Net Spend (a + b + c)          repeated closing figure
+Total Income (A)
+Total Variable Expenditure (B)
+Total Fixed Expenditure (C)
+Gross Expenditure                         B + C
+Total Expense Offsets (D)
+Net Expenditure                           B + C - D
+Operating Surplus / (Deficit)              A - B - C + D
+Total Investment & Savings Allocation (E)
+Net Surplus / (Deficit) After Allocations  A - B - C + D - E
 ```
 
-Variable spend, fixed spend, gross spend, offsets, and net spend are visually differentiated so a user can scan the calculation rather than audit formulas.
+The familiar navy, teal, light-blue, light-grey, green, and pale-yellow sheet palette separates each section. SGD amounts and red parenthesized deficits make the calculation easy to scan. Allocations never reduce gross expenditure or operating surplus; they reduce only the final result.
+
+**Example:** S$5,000 salary, S$1,000 Food, S$500 Parent Allowance, S$100 Reimbursements, and S$2,000 confirmed ETF contributions give **S$1,400 net expenditure**, **S$3,600 operating surplus**, and **S$1,600 after allocations**.
+
+### Review inputs and missing values
+
+| Input | Meaning |
+| --- | --- |
+| No recorded salary | The month displays `S$0.00`; an actually credited salary takes priority as soon as it is recorded. |
+| App -> `allocation_confirmed` checkbox | Confirm a fresh contribution once. This writes `transaction_type = contribution`; pending allocations are excluded from append and preview totals. Buying with money already in a portfolio is not another fresh contribution. |
+
+A recorded numeric zero is different from a missing amount. Invalid checked inputs leave the affected category and dependent subtotals blank; year totals also stay blank if any included month is missing. No salary estimate or currency conversion is assumed. A checked legacy allocation without contribution confirmation leaves allocation and final totals blank, but does not change operating surplus.
+
+### Migration caveats
+
+- Snapshot the workbook before the first redesign refresh. Summary now extends through row 45; a refresh stops if expanding the generated table would overwrite personal notes. Move those notes outside the new table before retrying.
+- Monthly refresh preserves ledger amounts, blanks, formulas, and categories. Legacy negative offsets are interpreted as positive received amounts without rewriting the ledger.
+- `Bills` is read as `Bills / Recurring Commitments`; `Reimbursement` is read as `Reimbursements`. Ambiguous `Family`, `Investments`, `Income`, `Funding`, and `GVs & Prize Award` entries require review, not automatic reclassification.
+- Do not count own-account transfers, investment sale/redemption proceeds, CPF balances, or noncash vouchers as salary. Reconcile duplicate month tabs before refreshing; another year's dated entries are excluded.
 
 ## How To Use It
 
-1. Upload one or more transaction screenshots in the Streamlit app.
-2. Let the app extract, normalize, classify, and compare transactions.
-3. Review the table. Correct category, money flow, amount, or duplicate decisions where needed.
-4. Confirm the checked rows to append them to the matching `YYYY` workbook and month tab.
-5. Open the refreshed `Summary` tab for the annual view.
+1. Drop one or more transaction screenshots into the Upload Inbox; processing starts automatically.
+2. Resolve the `Needs Attention` items using their screenshot, recorded-sheet match, and recommendation evidence.
+3. Inspect the collapsed `Ready` and `Excluded` groups and confirm fresh investment allocations where required.
+4. Review the financial effect and use the single append action to write the selected rows.
+5. Open the affected month tabs or annual Summary from the completion links.
+
+### Guided inbox architecture
+
+Each upload is retained as a batch outside the repository in the operating system's application-data directory. A batch stores screenshot processing states, transaction provenance, recommendations, user decisions, and append audits. The interface keeps routine rows compact and opens only uncertain, duplicate, invalid, or unusual rows for attention.
+
+An optional external recommendation service can be configured with `EXPENDITURE_AI_RECOMMENDATION_URL`. It receives normalized transaction data, screenshot provenance, merchant memory, and possible matches, then returns a structured category, flow, confidence, duplicate assessment, evidence, and review reasons. It cannot write to Google Sheets. Timeouts or malformed responses fall back to the deterministic rules, and successful responses are cached by screenshot, transaction, model, endpoint, and schema version.
+
+Google Sheets remains the transaction source of truth. Flow/category compatibility, signs, ignored bank transfers, allocation confirmation, duplicate blocking, year/month routing, and final append verification remain deterministic.
 
 ### Review states
 
@@ -187,6 +217,10 @@ VISION_CONCURRENCY=3
 | `GOOGLE_WORKSHEET_NAME` | Worksheet name for fixed-spreadsheet mode. |
 | `SCREENSHOT_ARCHIVE_DIR` | Archive folder; defaults to `screenshots`. |
 | `REVIEW_MEMORY_FILE` | Merchant-rule store; defaults to `review_memory.json`. |
+| `EXPENDITURE_AI_DATA_DIR` | Optional persistent guided-inbox directory; defaults to the operating-system app-data location. |
+| `EXPENDITURE_AI_RECOMMENDATION_URL` | Optional recommendation-only service endpoint. |
+| `EXPENDITURE_AI_RECOMMENDATION_API_KEY` | Optional bearer token for the recommendation service. |
+| `EXPENDITURE_AI_RECOMMENDATION_TIMEOUT_SECONDS` | External recommendation timeout; defaults to 5 seconds. |
 
 ### 3. Connect Google Drive
 
@@ -234,7 +268,13 @@ On Windows, `launch.bat` starts the app as well.
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The regression suite covers Google Sheets output, summary formulas and layout, category migrations, reimbursement and offset rules, duplicate detection, merchant rules, year/month routing, and performance behaviour.
+The offline regression suite covers Decimal reconciliation, exact statement formulas/layout, missing-value propagation, salary review persistence, allocation confirmation, non-mutating monthly refreshes, category migrations, PayLah/UOB exclusions, duplicate detection, merchant rules, year/month routing, and performance behaviour. Sheets calls use fakes; these tests do not evaluate formulas in a live workbook.
+
+Quiet run (including suppressed application logging):
+
+```powershell
+.\.venv\Scripts\python.exe -c "import logging,unittest; logging.disable(logging.CRITICAL); r=unittest.TextTestRunner(verbosity=0).run(unittest.defaultTestLoader.discover('tests')); raise SystemExit(not r.wasSuccessful())"
+```
 
 ## Privacy And Security
 
